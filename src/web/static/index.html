@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bitcoin Puzzle #71 Solver — Apple Silicon Control Center</title>
+  <meta name="description" content="Lokaler, energieeffizienter Solver für Bitcoin Puzzle #71 auf Apple Silicon M4 Metal.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23131315'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-family='monospace' font-size='25' fill='%23ededee'%3E%2371%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-mark" aria-hidden="true">#71</div>
+        <div>
+          <h1 class="app-title">Bitcoin Puzzle #71 Solver</h1>
+          <p class="app-subtitle">Apple Silicon M4 Metal Compute &middot; 100% Offline &middot; Zero Telemetry</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <div id="status-pill" class="status-pill status-paused" aria-live="polite">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="status-text">PAUSIERT</span>
+          <span class="status-separator" aria-hidden="true">&middot;</span>
+          <span id="status-mode">AUTO &middot; LIMIT 70%</span>
+        </div>
+      </div>
+    </header>
+
+    <div id="hit-alert" class="hit-alert hidden" role="alert">
+      <div class="hit-header">
+        <span class="hit-icon" aria-hidden="true">
+          <svg class="icon icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+          </svg>
+        </span>
+        <div>
+          <h2 class="hit-title">PUZZLE #71 TREFFER VERIFIZIERT</h2>
+          <p class="hit-subtitle">Der Treffer wurde auf der CPU verifiziert. Der Private Key wird ausschließlich in der lokalen Datei gespeichert und niemals über die Web-API übertragen.</p>
+        </div>
+      </div>
+      <div class="hit-body">
+        <div class="hit-row">
+          <span class="hit-label">Lokale Datei</span>
+          <code id="hit-filename" class="hit-code">FOUND_KEY.txt</code>
+        </div>
+        <div class="hit-row">
+          <span class="hit-label">Bitcoin Adresse (P2PKH)</span>
+          <code id="hit-address" class="hit-code">1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU</code>
+        </div>
+        <div class="hit-row">
+          <span class="hit-label">Zeitpunkt</span>
+          <time id="hit-timestamp" class="hit-code">–</time>
+        </div>
+        <div class="hit-row">
+          <span class="hit-label">CPU Re-Verifikation</span>
+          <span class="hit-badge-success">BESTÄTIGT &middot; DATEIRECHTE 0600</span>
+        </div>
+      </div>
+    </div>
+
+    <section class="target-bar" aria-label="Zielparameter">
+      <div class="target-item">
+        <span class="target-label">Ziel-Adresse</span>
+        <span class="target-value mono" id="target-address">1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU</span>
+      </div>
+      <div class="target-item">
+        <span class="target-label">Reward</span>
+        <span class="target-value mono">7.10 BTC</span>
+      </div>
+      <div class="target-item">
+        <span class="target-label">Suchbereich (2^70 .. 2^71 - 1)</span>
+        <span class="target-value target-range mono"><span>0x400000000000000000</span><span class="range-separator">bis</span><span>0x7FFFFFFFFFFFFFFFFF</span></span>
+      </div>
+      <div class="target-item">
+        <span class="target-label">Keyspace Gesamt</span>
+        <span class="target-value mono">1.1805e21 Keys</span>
+      </div>
+    </section>
+
+    <section class="controls-toolbar" aria-label="Steuerung">
+      <div class="toolbar-left">
+        <button type="button" id="btn-toggle-run" class="btn btn-primary">
+          <span id="btn-run-icon">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="6 3 20 12 6 21 6 3"></polygon>
+            </svg>
+          </span>
+          <span id="btn-run-label">Suche starten</span>
+        </button>
+        <button type="button" id="btn-selftest" class="btn btn-secondary">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="20 6 9 17 4 12"></polyline>
+          </svg>
+          <span>Mini-Puzzle Test (24-Bit)</span>
+        </button>
+      </div>
+
+      <div class="toolbar-right">
+        <div class="mode-selector-group">
+          <span class="selector-label">Power Modus</span>
+          <div class="mode-buttons" role="group" aria-label="GPU-Leistungsmodus">
+            <button type="button" id="mode-eco" class="btn-mode" data-mode="eco" aria-pressed="false">ECO &middot; 40%</button>
+            <button type="button" id="mode-balanced" class="btn-mode" data-mode="balanced" aria-pressed="false">BALANCED &middot; 70%</button>
+            <button type="button" id="mode-high" class="btn-mode" data-mode="high" aria-pressed="false">HIGH &middot; 85%</button>
+            <button type="button" id="mode-auto" class="btn-mode active" data-mode="auto" aria-pressed="true">AUTO &middot; BIS 90%</button>
+            <button type="button" id="mode-full" class="btn-mode" data-mode="full" aria-pressed="false">MAX &middot; 90%</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <main class="dashboard-grid">
+      <article class="card">
+        <div class="card-header">
+          <span class="card-title">Rechenleistung</span>
+          <span class="card-badge">Metal GPU</span>
+        </div>
+        <div class="card-body">
+          <div class="metric-hero">
+            <span id="val-speed-mkeys" class="metric-value">0.00</span>
+            <span class="metric-unit">Mkeys/s</span>
+          </div>
+          <div class="metric-sublist">
+            <div class="sub-row">
+              <span>Aktuell</span>
+              <strong id="val-speed-current" class="mono">0 keys/s</strong>
+            </div>
+            <div class="sub-row">
+              <span>Durchschnitt</span>
+              <strong id="val-speed-avg" class="mono">0 keys/s</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <span class="card-title">Energie &amp; Effizienz</span>
+          <span class="card-badge">Schätzung</span>
+        </div>
+        <div class="card-body">
+          <div class="metric-hero">
+            <span id="val-power-watts" class="metric-value">0.0</span>
+            <span class="metric-unit">Watt</span>
+          </div>
+          <div class="metric-sublist">
+            <div class="sub-row">
+              <span>Geschätzte Effizienz</span>
+              <strong id="val-keys-per-joule" class="text-success mono">0.00 Mkeys/Joule</strong>
+            </div>
+            <div class="sub-row">
+              <span>Pro Kilowattstunde</span>
+              <strong id="val-keys-per-kwh" class="mono">0.00 Bkeys/kWh</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <span class="card-title">Hardware-Zustand</span>
+          <span class="card-badge">Modell + Prozesswert</span>
+        </div>
+        <div class="card-body">
+          <div class="metric-hero">
+            <span id="val-soc-temp" class="metric-value">0.0</span>
+            <span class="metric-unit">&deg;C</span>
+          </div>
+          <div class="metric-sublist">
+            <div class="sub-row">
+              <span>Prozess-CPU</span>
+              <strong id="val-cpu-load" class="mono">0.0%</strong>
+            </div>
+            <div class="sub-row">
+              <span>GPU Dispatch-Anteil</span>
+              <strong id="val-gpu-duty" class="mono">0.0%</strong>
+            </div>
+            <div class="sub-row">
+              <span>Laufzeit</span>
+              <strong id="val-runtime" class="mono">00:00:00</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <span class="card-title">Fortschritt &amp; Blöcke</span>
+          <span class="card-badge">Lottery Range</span>
+        </div>
+        <div class="card-body">
+          <div class="metric-hero">
+            <span id="val-total-keys" class="metric-value-sm mono">0</span>
+            <span class="metric-unit">Keys</span>
+          </div>
+          <div id="coverage-meter" class="coverage-meter" role="progressbar" aria-label="Abdeckung des Suchbereichs" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span id="coverage-meter-fill" class="coverage-meter-fill"></span>
+          </div>
+          <div class="metric-sublist">
+            <div class="sub-row">
+              <span>Geprüfte Blöcke (2^24)</span>
+              <strong id="val-total-blocks" class="mono">0</strong>
+            </div>
+            <div class="sub-row">
+              <span>Letzter Checkpoint</span>
+              <strong id="val-checkpoint" class="mono">Noch nicht gespeichert</strong>
+            </div>
+            <div class="sub-row">
+              <span>Abdeckung 2^70</span>
+              <strong id="val-coverage-pct" class="mono">0.000000000000%</strong>
+            </div>
+          </div>
+        </div>
+      </article>
+    </main>
+
+    <section class="analytics-grid">
+      <article class="analytics-card">
+        <div class="analytics-header">
+          <h2 class="analytics-title">Stromkosten-Projektion auf Schätzbasis</h2>
+          <div class="cost-input-wrapper">
+            <label for="input-eur-kwh">Tarif</label>
+            <input type="number" id="input-eur-kwh" step="0.01" min="0.01" value="0.34">
+            <span class="mono">&euro;/kWh</span>
+          </div>
+        </div>
+        <div class="cost-grid">
+          <div class="cost-item">
+            <span class="cost-label">Seit Start</span>
+            <strong id="val-cost-start" class="cost-val">0.0000 &euro;</strong>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">Pro Tag</span>
+            <strong id="val-cost-day" class="cost-val">0.13 &euro;</strong>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">Pro Monat</span>
+            <strong id="val-cost-month" class="cost-val">4.10 &euro;</strong>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">Pro Jahr</span>
+            <strong id="val-cost-year" class="cost-val">49.80 &euro;</strong>
+          </div>
+        </div>
+      </article>
+
+      <article class="analytics-card">
+        <div class="analytics-header">
+          <h2 class="analytics-title">Trefferchance bei eindeutiger Suche</h2>
+          <span class="card-badge">Anteil am Keyspace</span>
+        </div>
+        <div class="odds-table">
+          <div class="odds-row">
+            <span class="odds-period">In 1 Stunde</span>
+            <span id="val-odds-1h-pct" class="odds-pct mono">1.98e-11</span>
+            <span id="val-odds-1h-ratio" class="odds-ratio mono">1 zu 50,5 Mrd.</span>
+          </div>
+          <div class="odds-row">
+            <span class="odds-period">In 24 Stunden</span>
+            <span id="val-odds-24h-pct" class="odds-pct mono">4.75e-10</span>
+            <span id="val-odds-24h-ratio" class="odds-ratio mono">1 zu 2,10 Mrd.</span>
+          </div>
+          <div class="odds-row">
+            <span class="odds-period">In 30 Tagen</span>
+            <span id="val-odds-30d-pct" class="odds-pct mono">1.43e-8</span>
+            <span id="val-odds-30d-ratio" class="odds-ratio mono">1 zu 70,1 Mio.</span>
+          </div>
+          <div class="odds-row highlight">
+            <span class="odds-period">In 1 Jahr</span>
+            <span id="val-odds-1y-pct" class="odds-pct mono">1.73e-7</span>
+            <span id="val-odds-1y-ratio" class="odds-ratio mono">1 zu 5,76 Mio.</span>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section class="activity-section">
+      <div class="activity-header">
+        <h2 class="activity-title">Lokales Solver-Ereignisprotokoll</h2>
+        <span id="log-count" class="log-count">0 Einträge</span>
+      </div>
+      <div id="log-container" class="log-container mono">
+        <div class="log-entry log-info">[SYSTEM] Initialisiere Bitcoin Puzzle #71 Solver Control Center...</div>
+      </div>
+    </section>
+
+    <footer class="app-footer">
+      <p>Bitcoin Puzzle #71 Lottery Solver &middot; Mac mini M4 &middot; Checkpoint: <code class="mono">puzzle71_checkpoint.json</code> (0600) &middot; Treffer werden lokal in <code class="mono">FOUND_KEY*.txt</code> gesichert.</p>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+[package]
+name = "puzzle71_solver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.189"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

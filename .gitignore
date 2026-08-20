@@ -1,0 +1,12 @@
+/target
+puzzle71_solver
+puzzle71_checkpoint*.json
+solver*.log
+FOUND_KEY*.txt
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
