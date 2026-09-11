@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bitcoin = { version = "=0.32.11", features = ["bitcoinconsensus"] }
 libc = "0.2.189"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
