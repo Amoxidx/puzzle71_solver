@@ -221,8 +221,9 @@ mod tests {
     use crate::claim::error::ClaimError;
     use crate::claim::net::allowlist::Method;
     use crate::claim::net::error::NetError;
-    use crate::claim::net::http::{HttpResponse, Transport};
+    use crate::claim::net::http::{CurlTransport, HttpResponse, Transport};
     use crate::claim::prevout::p2pkh_script_for_hash160;
+    use crate::claim::service::MIN_EXPECTED_ECONOMIC_TOTAL_SAT;
     use crate::puzzle_config::{TARGET_ADDRESS, TARGET_HASH160};
     use bitcoin::hex::DisplayHex;
     use bitcoin::{
@@ -549,6 +550,38 @@ mod tests {
         assert_ne!(
             snapshot.prevouts[0].outpoint.vout,
             snapshot.prevouts[1].outpoint.vout
+        );
+    }
+
+    #[test]
+    #[ignore = "live network"]
+    fn live_fetch_verified_prevouts_from_both_sources() {
+        let source = EsploraUtxoSource::new(CurlTransport);
+        let snapshot = source
+            .fetch_verified_prevouts()
+            .expect("live dual-source fetch");
+        assert!(
+            !snapshot.prevouts.is_empty(),
+            "expected at least one confirmed prevout"
+        );
+        let expected_script = p2pkh_script_for_hash160(TARGET_HASH160);
+        let mut total_sat = 0u64;
+        for prevout in &snapshot.prevouts {
+            assert_eq!(
+                prevout.txout.script_pubkey.as_script(),
+                expected_script.as_script()
+            );
+            total_sat += prevout.txout.value.to_sat();
+        }
+        assert!(
+            total_sat >= MIN_EXPECTED_ECONOMIC_TOTAL_SAT,
+            "economic total {total_sat} sat is below {MIN_EXPECTED_ECONOMIC_TOTAL_SAT}"
+        );
+        println!(
+            "confirmed_count={} total_sat={} unconfirmed_count={}",
+            snapshot.prevouts.len(),
+            total_sat,
+            snapshot.unconfirmed_count
         );
     }
 }

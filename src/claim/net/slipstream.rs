@@ -245,10 +245,12 @@ mod tests {
     use crate::claim::policy;
     use crate::claim::test_support::{self, TEST_SCALAR};
     use crate::claim::{build_signed_claim, p2pkh_script_for_hash160};
+    use bitcoin::address::NetworkUnchecked;
     use bitcoin::hashes::Hash;
     use bitcoin::hex::DisplayHex;
     use bitcoin::{Address, PubkeyHash};
     use std::cell::RefCell;
+    use std::str::FromStr;
 
     struct FakeTransport {
         get: RefCell<Vec<(String, HttpResponse)>>,
@@ -598,6 +600,49 @@ mod tests {
         let submitter = SlipstreamSubmitter::new(CurlTransport);
         let floor = submitter.fee_floor_sat_vb().expect("live GET /api/rates");
         assert!(floor >= 1, "floor was {floor}");
+    }
+
+    #[test]
+    #[ignore = "live network"]
+    fn live_submit_of_an_unspendable_claim_is_rejected() {
+        // Safe on mainnet: both inputs come from self-built funding transactions whose
+        // txids do not exist there, so this signed transaction can never become valid
+        // and can never move real coins.
+        let key = test_support::test_claim_key();
+        let hash160 = test_support::derive_hash160(TEST_SCALAR);
+        let prevouts = [
+            test_support::funded_prevout(hash160, 1_000_000),
+            test_support::funded_prevout(hash160, 2_000_000),
+        ];
+        let destination =
+            Address::<NetworkUnchecked>::from_str("bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw")
+                .expect("fixed mainnet bech32")
+                .require_network(bitcoin::Network::Bitcoin)
+                .expect("mainnet");
+        let claim = build_signed_claim(
+            &key,
+            &prevouts,
+            &destination,
+            policy::DEFAULT_FEE_RATE_SAT_VB,
+        )
+        .expect("unspendable test claim");
+
+        let submitter = SlipstreamSubmitter::new(CurlTransport);
+        match submitter.submit(&claim) {
+            Err(SubmitError::Rejected(msg)) => {
+                println!("rejected: {msg}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        const UNKNOWN_TXID: &str =
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        assert_eq!(
+            submitter
+                .status(UNKNOWN_TXID)
+                .expect("live status of unknown txid"),
+            TxStatus::NotFound
+        );
     }
 
     #[test]
