@@ -259,6 +259,7 @@ enum Phase {
     Confirmed {
         txid: String,
         block_height: u64,
+        submitted_at_unix: u64,
     },
     Failed {
         reason: String,
@@ -345,7 +346,9 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                 txid: txid.clone(),
                 submitted_at_unix: *submitted_at_unix,
             },
-            Phase::Confirmed { txid, block_height } => ClaimState::Confirmed {
+            Phase::Confirmed {
+                txid, block_height, ..
+            } => ClaimState::Confirmed {
                 txid: txid.clone(),
                 block_height: *block_height,
             },
@@ -572,6 +575,7 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                         self.phase = Phase::Confirmed {
                             txid: prepared_summary.txid.clone(),
                             block_height,
+                            submitted_at_unix: written_at,
                         };
                         Ok(SubmitReceipt {
                             txid: prepared_summary.txid,
@@ -621,6 +625,7 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                 *not_found_polls,
                 true,
                 false,
+                false,
             )),
             Phase::AwaitingOwner {
                 pending: Some((txid, submitted_at)),
@@ -633,19 +638,35 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
             | Phase::Prepared {
                 pending: Some((txid, submitted_at)),
                 ..
-            } => Some((txid.clone(), *submitted_at, 0, false, false)),
+            } => Some((txid.clone(), *submitted_at, 0, false, false, false)),
             Phase::Locked {
                 pending: Some((txid, submitted_at)),
-            } => Some((txid.clone(), *submitted_at, 0, false, true)),
+            } => Some((txid.clone(), *submitted_at, 0, false, true, false)),
+            Phase::Confirmed {
+                txid,
+                submitted_at_unix,
+                ..
+            } => Some((txid.clone(), *submitted_at_unix, 0, false, false, true)),
             _ => None,
         };
-        let Some((txid, submitted_at, not_found_polls, from_submitted, from_locked)) = snapshot
+        let Some((
+            txid,
+            submitted_at,
+            not_found_polls,
+            from_submitted,
+            from_locked,
+            from_confirmed,
+        )) = snapshot
         else {
             return;
         };
         match self.submitter.status(&txid) {
             Ok(TxStatus::Confirmed { block_height }) => {
-                self.phase = Phase::Confirmed { txid, block_height };
+                self.phase = Phase::Confirmed {
+                    txid,
+                    block_height,
+                    submitted_at_unix: submitted_at,
+                };
             }
             Ok(TxStatus::Pending) => {
                 if let Phase::Submitted {
@@ -662,7 +683,13 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                 }
             }
             Ok(TxStatus::NotFound) => {
-                if from_submitted {
+                if from_confirmed {
+                    self.phase = Phase::Submitted {
+                        txid,
+                        submitted_at_unix: submitted_at,
+                        not_found_polls: 1,
+                    };
+                } else if from_submitted {
                     let next = not_found_polls.saturating_add(1);
                     if next >= MAX_NOT_FOUND_POLLS {
                         self.phase = Phase::Failed {
@@ -1382,6 +1409,7 @@ mod tests {
         confirmed.phase = Phase::Confirmed {
             txid: "ff".repeat(32),
             block_height: 2,
+            submitted_at_unix: 1,
         };
         assert_eq!(
             confirmed.prepare(DEST).unwrap_err(),
@@ -1926,6 +1954,129 @@ mod tests {
                 block_height: 13
             }
         );
+    }
+
+    #[test]
+    fn poll_from_confirmed_returns_to_submitted_when_the_tx_is_pending_again() {
+        let mut service = harness();
+        let txid = "ab".repeat(32);
+        let submitted_at_unix = 1_700_000_000;
+        service.phase = Phase::Confirmed {
+            txid: txid.clone(),
+            block_height: 103,
+            submitted_at_unix,
+        };
+        service.submitter.status.set(TxStatus::Pending);
+        service.poll();
+        match &service.phase {
+            Phase::Submitted {
+                txid: got_txid,
+                submitted_at_unix: got_at,
+                not_found_polls,
+            } => {
+                assert_eq!(got_txid, &txid);
+                assert_eq!(*got_at, submitted_at_unix);
+                assert_eq!(*not_found_polls, 0);
+            }
+            _ => panic!("expected Submitted after reorg to pending"),
+        }
+        assert_eq!(
+            service.state(),
+            ClaimState::Submitted {
+                txid,
+                submitted_at_unix
+            }
+        );
+    }
+
+    #[test]
+    fn poll_from_confirmed_updates_the_block_height() {
+        let mut service = harness();
+        let txid = "cd".repeat(32);
+        service.phase = Phase::Confirmed {
+            txid: txid.clone(),
+            block_height: 103,
+            submitted_at_unix: 1,
+        };
+        service
+            .submitter
+            .status
+            .set(TxStatus::Confirmed { block_height: 104 });
+        service.poll();
+        assert_eq!(
+            service.state(),
+            ClaimState::Confirmed {
+                txid,
+                block_height: 104
+            }
+        );
+        match &service.phase {
+            Phase::Confirmed {
+                submitted_at_unix, ..
+            } => assert_eq!(*submitted_at_unix, 1),
+            _ => panic!("expected Confirmed with preserved submitted_at_unix"),
+        }
+    }
+
+    #[test]
+    fn poll_from_confirmed_with_not_found_counts_towards_failure() {
+        let mut service = harness();
+        let txid = "ef".repeat(32);
+        let submitted_at_unix = 1;
+        service.phase = Phase::Confirmed {
+            txid: txid.clone(),
+            block_height: 103,
+            submitted_at_unix,
+        };
+        service.submitter.status.set(TxStatus::NotFound);
+        service.poll();
+        match &service.phase {
+            Phase::Submitted {
+                txid: got_txid,
+                submitted_at_unix: got_at,
+                not_found_polls,
+            } => {
+                assert_eq!(got_txid, &txid);
+                assert_eq!(*got_at, submitted_at_unix);
+                assert_eq!(*not_found_polls, 1);
+            }
+            _ => panic!("expected Submitted with not_found_polls = 1"),
+        }
+        for _ in 0..(MAX_NOT_FOUND_POLLS - 1) {
+            service.poll();
+        }
+        assert_eq!(
+            service.state(),
+            ClaimState::Failed {
+                reason: "submission_not_found".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn poll_from_confirmed_keeps_state_on_transport_error() {
+        let mut service = harness();
+        let txid = "aa".repeat(32);
+        service.phase = Phase::Confirmed {
+            txid: txid.clone(),
+            block_height: 103,
+            submitted_at_unix: 1,
+        };
+        service.submitter.status_err.set(true);
+        service.poll();
+        assert_eq!(
+            service.state(),
+            ClaimState::Confirmed {
+                txid,
+                block_height: 103
+            }
+        );
+        match &service.phase {
+            Phase::Confirmed {
+                submitted_at_unix, ..
+            } => assert_eq!(*submitted_at_unix, 1),
+            _ => panic!("expected Confirmed unchanged on transport error"),
+        }
     }
 
     #[test]
