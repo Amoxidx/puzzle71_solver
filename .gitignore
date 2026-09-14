@@ -3,6 +3,10 @@ puzzle71_solver
 puzzle71_checkpoint*.json
 solver*.log
 FOUND_KEY*.txt
+.FOUND_KEY*.tmp
+CLAIM_SUBMITTED*.json
+.CLAIM_SUBMITTED*.tmp
+web-tests/screenshots/
 .DS_Store
 .env
 .env.*

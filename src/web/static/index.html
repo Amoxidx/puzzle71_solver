@@ -11,6 +11,71 @@
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
   <div class="app-container">
+    <section id="claim-panel" class="claim-panel hidden" aria-labelledby="claim-title">
+      <p class="claim-eyebrow">Bitcoin Puzzle #71</p>
+      <h2 id="claim-title" class="claim-title">PUZZLE SOLVED</h2>
+      <p class="claim-lede">Private Key lokal verifiziert. Die Auszahlung geht ausschließlich privat an MARA Slipstream – nie in den öffentlichen Mempool.</p>
+
+      <div id="claim-alert-row" class="claim-alert-row">
+        <p id="claim-alert-status" class="claim-alert-status" aria-live="polite"></p>
+        <button type="button" id="btn-claim-resend" class="btn btn-secondary">Neuen Code senden</button>
+      </div>
+
+      <div id="claim-step-destination" class="claim-step">
+        <div class="claim-field">
+          <label for="claim-destination">Deine BTC-Adresse</label>
+          <input id="claim-destination" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" class="mono">
+          <p class="claim-hint">Adresse aus deiner Hardware-Wallet einfügen</p>
+        </div>
+        <button type="button" id="btn-claim-prepare" class="btn btn-primary">Adresse prüfen</button>
+        <p id="claim-destination-error" class="claim-error" role="alert"></p>
+        <p id="claim-destination-mismatch" class="claim-error" role="alert"></p>
+      </div>
+
+      <div id="claim-step-summary" class="claim-step hidden">
+        <p id="claim-summary-destination" class="claim-address-groups mono"></p>
+        <dl class="claim-summary-grid">
+          <div class="claim-summary-row">
+            <dt>Eingänge</dt>
+            <dd id="claim-summary-inputs" class="mono"></dd>
+          </div>
+          <div class="claim-summary-row">
+            <dt>Gebühr</dt>
+            <dd id="claim-summary-fee" class="mono"></dd>
+          </div>
+          <div class="claim-summary-row claim-summary-payout">
+            <dt>Auszahlung</dt>
+            <dd id="claim-summary-payout" class="mono"></dd>
+          </div>
+          <div class="claim-summary-row">
+            <dt>Nicht ausgegebener Staub</dt>
+            <dd id="claim-summary-dust" class="mono"></dd>
+          </div>
+        </dl>
+        <label class="claim-check">
+          <input id="claim-verified-on-device" type="checkbox">
+          <span>Ich habe die Adresse Zeichen für Zeichen auf dem Display meiner Hardware-Wallet verglichen</span>
+        </label>
+      </div>
+
+      <div id="claim-step-confirm" class="claim-step hidden">
+        <div class="claim-field">
+          <label for="claim-code">Code aus Telegram</label>
+          <input id="claim-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" class="mono">
+          <p id="claim-attempts" class="claim-hint"></p>
+        </div>
+        <button type="button" id="btn-claim-confirm" class="btn btn-danger" disabled>Transaktion an MARA Slipstream senden</button>
+      </div>
+
+      <p id="claim-confirm-error" class="claim-error" role="alert"></p>
+
+      <div id="claim-step-result" class="claim-step hidden">
+        <p id="claim-result-status" class="claim-result-status"></p>
+        <p id="claim-result-txid" class="claim-txid mono"></p>
+        <p id="claim-result-detail" class="claim-result-detail"></p>
+      </div>
+    </section>
+
     <section class="command-deck">
       <header class="app-header">
         <div class="header-left">

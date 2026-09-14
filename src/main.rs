@@ -4,11 +4,17 @@
 //! Zero-Telemetry, fully offline, audit-ready for Apple Silicon Mac mini M4.
 
 use puzzle71_solver::bench::run_comprehensive_benchmark;
+use puzzle71_solver::claim::{
+    ClaimService, ClaimState, CurlTransport, EsploraUtxoSource, FoundKeyFile, SlipstreamSubmitter,
+    TelegramNotifier, find_verified_found_key,
+};
 use puzzle71_solver::crypto::cpu_engine::run_mini_puzzle_test;
 use puzzle71_solver::hit_handler::verify_and_save_candidate;
 use puzzle71_solver::metal_engine::metal_solver::MetalSolver;
 use puzzle71_solver::power::controller::{PowerGovernor, PowerMode};
-use puzzle71_solver::puzzle_config::{RANGE_MIN, RANGE_SIZE, TARGET_HASH160};
+use puzzle71_solver::puzzle_config::{
+    RANGE_MAX, RANGE_MIN, RANGE_SIZE, TARGET_ADDRESS, TARGET_HASH160,
+};
 use puzzle71_solver::search::block_progress::BlockProgress;
 use puzzle71_solver::search::checkpoint::{CheckpointState, DEFAULT_CHECKPOINT_FILE};
 use puzzle71_solver::search::duplicate_filter::DuplicateFilter;
@@ -17,9 +23,10 @@ use puzzle71_solver::ui::terminal::SolverStats;
 use puzzle71_solver::web::server::{PublicHitStatus, SharedSolverState, start_web_server};
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -43,6 +50,19 @@ fn main() {
             "--test-mini" => {
                 run_self_test();
                 return;
+            }
+            "--telegram-test" => {
+                let notifier = TelegramNotifier::new(CurlTransport, telegram_config_path());
+                match notifier.send_test_alert() {
+                    Ok(()) => {
+                        println!("Telegram-Test gesendet");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Telegram-Test fehlgeschlagen: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             "--mode" => {
                 if i + 1 < args.len() {
@@ -119,6 +139,22 @@ fn main() {
         libc::signal(libc::SIGTERM, handle_sigint as *const () as usize);
     }
     SHUTDOWN_SIGNAL.store(false, Ordering::SeqCst);
+
+    let found_key_scan =
+        find_verified_found_key(Path::new("."), TARGET_HASH160, RANGE_MIN..=RANGE_MAX);
+    if let Some(found_path) = found_key_scan.found {
+        resume_from_found_key(&web_host, web_port, found_path);
+        return;
+    }
+    if !found_key_scan.unloadable.is_empty() {
+        let details = found_key_scan
+            .unloadable
+            .iter()
+            .map(|(name, reason)| format!("{name}: {reason:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("WARNING: FOUND_KEY file present but not loadable ({details})");
+    }
 
     // Step 3: Load existing checkpoint if available
     let mut checkpoint =
@@ -288,6 +324,7 @@ fn main() {
                             println!("  Bitcoin Adresse:   {}", hit.bitcoin_address);
                             println!("  Saved locally to:  {} (mode 0600)", hit.saved_filename);
                             println!("  DO NOT UPLOAD OR SHARE THIS KEY!");
+                            init_claim_service(&shared_state, PathBuf::from(&hit.saved_filename));
                             terminal_state = true;
                             break 'search;
                         }
@@ -464,6 +501,93 @@ fn dispatch_profile(mode: PowerMode) -> DispatchProfile {
     }
 }
 
+fn resume_from_found_key(web_host: &str, web_port: u16, found_path: PathBuf) {
+    let shared_state = SharedSolverState::new();
+    shared_state.is_running.store(false, Ordering::SeqCst);
+    let timestamp_unix = std::fs::metadata(&found_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let saved_filename = found_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("FOUND_KEY.txt")
+        .to_string();
+    *shared_state.hit.lock().unwrap() = Some(PublicHitStatus {
+        bitcoin_address: TARGET_ADDRESS.to_string(),
+        saved_filename,
+        timestamp_unix,
+    });
+    start_web_server(web_host, web_port, shared_state.clone()).unwrap_or_else(|e| {
+        eprintln!(
+            "CRITICAL: Could not start web server on {}:{}: {}",
+            web_host, web_port, e
+        );
+        std::process::exit(1);
+    });
+    init_claim_service(&shared_state, found_path);
+    println!("Dashboard remains available for the recovered claim. Press CTRL+C to exit.");
+    while !SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(250));
+    }
+    println!("\nShutdown complete.");
+}
+
+fn telegram_config_path() -> PathBuf {
+    let home = env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/puzzle71/telegram.json")
+}
+
+fn init_claim_service(shared_state: &SharedSolverState, found_key_path: PathBuf) {
+    let service = ClaimService::new(
+        EsploraUtxoSource::new(CurlTransport),
+        SlipstreamSubmitter::new(CurlTransport),
+        TelegramNotifier::new(CurlTransport, telegram_config_path()),
+        FoundKeyFile::new(found_key_path),
+        PathBuf::from("CLAIM_SUBMITTED.json"),
+    );
+    let skip_alert = matches!(service.state(), ClaimState::Submitted { .. });
+    {
+        let mut slot = shared_state.claim.lock().unwrap();
+        *slot = Some(Box::new(service));
+        if let Some(svc) = slot.as_ref() {
+            *shared_state.claim_snapshot.lock().unwrap() = Some(svc.state());
+        }
+    }
+    if !skip_alert {
+        let claim = shared_state.claim.clone();
+        let snapshot = shared_state.claim_snapshot.clone();
+        thread::spawn(move || {
+            let mut slot = match claim.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(svc) = slot.as_mut() {
+                svc.on_verified_hit();
+                *snapshot.lock().unwrap() = Some(svc.state());
+            }
+        });
+    }
+    let claim = shared_state.claim.clone();
+    let snapshot = shared_state.claim_snapshot.clone();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(60));
+            let mut slot = match claim.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(svc) = slot.as_mut() else {
+                continue;
+            };
+            svc.poll();
+            *snapshot.lock().unwrap() = Some(svc.state());
+        }
+    });
+}
+
 fn persist_checkpoint(
     checkpoint: &mut CheckpointState,
     runtime_before_session: f64,
@@ -510,6 +634,7 @@ fn print_help() {
     println!("  --no-tui                          Disable terminal ANSI rendering");
     println!("  --bench                           Run comprehensive CPU vs Metal power benchmark");
     println!("  --test-mini                       Run 24-bit Mini-Puzzle self-test verification");
+    println!("  --telegram-test                   Send one Telegram test message and exit");
     println!("  --electricity-price <EUR/kWh>     Configure electricity cost (default: 0.34)");
     println!("  --block-size <keys>               Divisor of 2^70 yielding at most 2^64-1 blocks");
     println!("  --help, -h                        Show this help message");

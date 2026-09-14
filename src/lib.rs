@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod claim;
 pub mod crypto;
 pub mod hit_handler;
 pub mod metal_engine;

@@ -26,7 +26,7 @@ cargo run --release -- --help
 cargo run --release -- --mode auto
 ```
 
-Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtenden Kryptografie- und 24-Bit-Mini-Puzzle-Selbsttest aus. Danach startet es den Solver und das Dashboard. Die separaten Modi `--bench` und `--test-mini` führen ihre jeweilige Aufgabe aus und beenden sich anschließend. Das kompilierte Programm liegt nach dem Release-Build unter `target/release/puzzle71_solver`.
+Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtenden Kryptografie- und 24-Bit-Mini-Puzzle-Selbsttest aus. Danach startet es den Solver und das Dashboard. Die separaten Modi `--bench`, `--test-mini` und `--telegram-test` führen ihre jeweilige Aufgabe aus und beenden sich anschließend. Das kompilierte Programm liegt nach dem Release-Build unter `target/release/puzzle71_solver`.
 
 ### Unterstützte Optionen
 
@@ -37,12 +37,13 @@ Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtend
 --no-tui                              Terminal-Anzeige deaktivieren
 --bench                               CPU-/Metal-Power-Benchmark ausführen und beenden
 --test-mini                           24-Bit-CPU-Mini-Puzzle testen und beenden
+--telegram-test                      Telegram-Testnachricht senden und beenden
 --electricity-price <EUR/kWh>         Kostenparameter für die Anzeige, Standard: 0.34
 --block-size <keys>                   Teiler von 2^70 für die Suchblöcke
 --help, -h                            Hilfe anzeigen
 ```
 
-`--host` akzeptiert nur `127.0.0.1`, `localhost` oder `::1`; eine Bindung an eine öffentliche Adresse wird abgelehnt. `--block-size` muss größer als null sein, `2^70` exakt teilen und darf höchstens `2^64 - 1` Blöcke erzeugen. Ohne Angabe verwendet der Solver `2^24` Schlüssel pro Block (`16.777.216`). Der CLI-Kostenparameter beeinflusst ausschließlich TUI und Benchmark, nicht die Suche. Das Dashboard besitzt dafür ein separates, lokal änderbares Eingabefeld.
+`--host` akzeptiert nur `127.0.0.1`; eine Bindung an `localhost`, `::1` oder eine öffentliche Adresse wird abgelehnt. `--block-size` muss größer als null sein, `2^70` exakt teilen und darf höchstens `2^64 - 1` Blöcke erzeugen. Ohne Angabe verwendet der Solver `2^24` Schlüssel pro Block (`16.777.216`). Der CLI-Kostenparameter beeinflusst ausschließlich TUI und Benchmark, nicht die Suche. Das Dashboard besitzt dafür ein separates, lokal änderbares Eingabefeld.
 
 Beispiele:
 
