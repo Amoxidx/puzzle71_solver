@@ -26,7 +26,7 @@ cargo run --release -- --help
 cargo run --release -- --mode auto
 ```
 
-Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtenden Kryptografie- und 24-Bit-Mini-Puzzle-Selbsttest aus. Danach startet es den Solver und das Dashboard. Die separaten Modi `--bench`, `--test-mini` und `--telegram-test` führen ihre jeweilige Aufgabe aus und beenden sich anschließend. Das kompilierte Programm liegt nach dem Release-Build unter `target/release/puzzle71_solver`.
+Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtenden CPU-Kryptografie- und Mini-Puzzle-Selbsttest mit einem 24-Bit-Schlüssel aus. Dieser prüft nicht den vollständigen Suchraum von `2^24` Schlüsseln und ersetzt keinen GPU-Test. Danach startet es den Solver und das Dashboard. Die separaten Modi `--bench`, `--test-mini` und `--telegram-test` führen ihre jeweilige Aufgabe aus und beenden sich anschließend. Das kompilierte Programm liegt nach dem Release-Build unter `target/release/puzzle71_solver`.
 
 ### Unterstützte Optionen
 
@@ -63,7 +63,7 @@ cargo run --release -- --electricity-price 0.34 --bench
 
 Standardmäßig ist das Dashboard unter [http://127.0.0.1:8080](http://127.0.0.1:8080) erreichbar. Es wird zusammen mit dem Solver gestartet und zeigt unter anderem Laufstatus, Power-Modus, Keys/s, geprüfte Blöcke, Laufzeit, geschätzte Package-Power, geschätzte SoC-Temperatur, CPU-Last, GPU-Duty-Limit und den Zeitpunkt des letzten Checkpoints.
 
-Die Oberfläche kann die Suche pausieren/fortsetzen, den Power-Modus ändern und den 24-Bit-CPU-Selbsttest auslösen. Die eingebettete HTTP-API stellt dafür nur lokale Status- und Steuerpfade bereit (`/api/status`, `/api/start`, `/api/stop`, `/api/mode`, `/api/selftest`). Für POST-Anfragen wird zusätzlich eine passende lokale Origin geprüft. Es gibt keine Anmeldung, keine TLS-Schicht und keine Berechtigungstrennung: Wer Zugriff auf den lokalen Dienst hat, kann ihn steuern. Das Dashboard darf deshalb nicht über einen Proxy oder eine öffentliche Netzwerkschnittstelle exponiert werden.
+Die Oberfläche kann die Suche pausieren/fortsetzen, den Power-Modus ändern und den CPU-Selbsttest auslösen. Die eingebettete HTTP-API stellt lokale Status- und Steuerpfade bereit (`/api/status`, `/api/start`, `/api/stop`, `/api/mode`, `/api/selftest`). Bei einem verifizierten Treffer kommen die Claim-Pfade für Vorbereitung, Bestätigung und erneuten Code-Versand hinzu. Für POST-Anfragen wird zusätzlich eine passende lokale Origin geprüft. Es gibt keine Anmeldung, keine TLS-Schicht und keine Berechtigungstrennung: Wer Zugriff auf den lokalen Dienst hat, kann ihn steuern. Das Dashboard darf deshalb nicht über einen Proxy oder eine öffentliche Netzwerkschnittstelle exponiert werden.
 
 ## Power-Modi und Duty-Limit
 
@@ -89,11 +89,12 @@ Gespeichert werden Puzzle-Nummer, Laufzeit, Zähler und sortierte, nicht überla
 
 Bei einem Metal-Kandidaten stoppt der Suchlauf und leitet eine unabhängige, reine CPU-Verifikation der Adresse und des HASH160 ein. Nur bei erfolgreicher Prüfung wird die private Information lokal in `FOUND_KEY.txt` (oder einem kollisionsfreien Fallback-Namen) mit `0600` gespeichert. Bestehende Trefferdateien werden nicht überschrieben.
 
-Die Web-API und der Dashboard-Status enthalten bei einem Treffer ausschließlich Bitcoin-Adresse, lokalen Dateinamen und Zeitstempel — niemals den Private Key. Checkpoints enthalten keine privaten Schlüssel. Trotzdem ist das Arbeitsverzeichnis vertraulich zu behandeln: `FOUND_KEY.txt` enthält den Private Key im Klartext. Nicht hochladen, nicht teilen und nicht in Logs, Screenshots oder Backups ohne geeignete Schutzmaßnahmen übernehmen. Für eine eventuelle Weiterverwendung ist eine offline beziehungsweise air-gapped Vorgehensweise erforderlich.
+Die Web-API und der Dashboard-Status enthalten bei einem Treffer ausschließlich öffentliche Treffer- und Claim-Informationen — niemals den Private Key oder die signierte Transaktion. Checkpoints enthalten keine privaten Schlüssel. Trotzdem ist das Arbeitsverzeichnis vertraulich zu behandeln: `FOUND_KEY.txt` enthält den Private Key im Klartext. Nicht hochladen, nicht teilen und nicht in Logs, Screenshots oder Backups ohne geeignete Schutzmaßnahmen übernehmen. Eine manuelle Weiterverwendung des Schlüssels sollte offline erfolgen. Der eingebaute Claim-Pfad benötigt Netzwerkzugriff und reicht die signierte Transaktion ausschließlich bei MARA Slipstream ein.
 
 ## Sicherheits- und Privacy-Grenzen
 
-- Der Code enthält keinen Telemetrie- oder automatischen Broadcast-Pfad; das Dashboard stellt nur den lokalen HTTP-Dienst bereit.
+- Die Suche und das Dashboard können lokal ohne externe Netzwerkverbindung arbeiten. Der Gesamtprozess ist nicht vollständig offline: Bei einem verifizierten Treffer versucht er einen Telegram-Alert; Claim-Vorbereitung, Einreichung und Statusabfragen verwenden externe Dienste. Eine Einreichung erfolgt erst nach ausdrücklicher Bestätigung im Dashboard.
+- Der Claim-Pfad gleicht UTXOs über mempool.space und blockstream.info ab und reicht ausschließlich bei MARA Slipstream ein. Die Privatsphäre der Einreichung hängt auch vom Verhalten dieses Providers ab. Private Keys werden dafür nicht übertragen; die signierte Transaktion enthält den öffentlichen Schlüssel.
 - Loopback-Bindung und lokale Origin-Prüfung reduzieren die Angriffsfläche, ersetzen aber keine Authentifizierung oder TLS.
 - Der Prozess vertraut den Dateirechten und der Sicherheit des macOS-Benutzerkontos. Andere Prozesse mit ausreichenden lokalen Rechten können Dateien oder Prozessdaten weiterhin lesen.
 - Private Keys werden nicht im Dashboard ausgegeben, aber die Trefferdatei enthält sie absichtlich vollständig.

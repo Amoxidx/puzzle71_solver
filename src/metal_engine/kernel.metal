@@ -140,26 +140,28 @@ inline U256 u256_mul(thread const U256& a, thread const U256& b) {
     sum_limbs[8] = (uint32_t)s8;
     sum_limbs[9] = h_prod[9] + (uint32_t)(s8 >> 32);
 
-    // Reduce any remaining overflow in sum_limbs[8..9]
+    // Reduce the coefficient of 2^256. 2^256 ≡ 0x1000003D1 (mod P),
+    // with 0x1000003D1 = 2^32 + 977. The carry out of that fold is again
+    // a coefficient of 2^256; leaving it on the floor drops whole multiples
+    // of 0x1000003D1 ((p-65537)^2 came back 0x1fc30 instead of 0x100020001).
+    // A product of two canonical field elements overflows by well under 2^36,
+    // so three folds are enough. The fourth iteration is only a bound.
     uint64_t extra = (uint64_t)sum_limbs[8] | ((uint64_t)sum_limbs[9] << 32);
-    if (extra != 0) {
-        uint64_t extra_prod = extra * 977ULL;
-        uint64_t extra_shift = extra; // * 2^32
-
-        c = extra_prod;
+    for (int fold = 0; fold < 4 && extra != 0; ++fold) {
+        uint64_t low_carry = extra * 977ULL;
         for (int i = 0; i < 8; ++i) {
-            uint64_t s = (uint64_t)sum_limbs[i] + (c & 0xFFFFFFFFULL);
+            uint64_t s = (uint64_t)sum_limbs[i] + (low_carry & 0xFFFFFFFFULL);
             sum_limbs[i] = (uint32_t)s;
-            c = (s >> 32) + (c >> 32);
+            low_carry = (low_carry >> 32) + (s >> 32);
         }
 
-        // Add extra_shift at index 1
-        c = extra_shift;
+        uint64_t shift_carry = extra;
         for (int i = 1; i < 8; ++i) {
-            uint64_t s = (uint64_t)sum_limbs[i] + (c & 0xFFFFFFFFULL);
+            uint64_t s = (uint64_t)sum_limbs[i] + (shift_carry & 0xFFFFFFFFULL);
             sum_limbs[i] = (uint32_t)s;
-            c = (s >> 32) + (c >> 32);
+            shift_carry = (shift_carry >> 32) + (s >> 32);
         }
+        extra = low_carry + shift_carry;
     }
 
     U256 out;

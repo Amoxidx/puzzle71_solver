@@ -1,7 +1,7 @@
 //! Bitcoin Puzzle #71 Local Energy-Efficient Lottery Solver & Web Control Center.
 //!
 //! Exclusively targets Bitcoin Puzzle #71.
-//! Zero-Telemetry, fully offline, audit-ready for Apple Silicon Mac mini M4.
+//! Local search for Apple Silicon; hit notifications and claims use network services.
 
 use puzzle71_solver::bench::run_comprehensive_benchmark;
 use puzzle71_solver::claim::{
