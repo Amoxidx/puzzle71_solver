@@ -88,10 +88,10 @@ fn build_invocation_with(
     timeout_secs: u64,
     tls: TlsMode,
 ) -> Result<(Vec<String>, String), NetError> {
-    if let Some(body) = json_body {
-        if body.starts_with('@') {
-            return Err(NetError::InvalidInput);
-        }
+    if let Some(body) = json_body
+        && body.starts_with('@')
+    {
+        return Err(NetError::InvalidInput);
     }
 
     let mut args = vec!["-q".to_string(), "-sS".to_string(), "--globoff".to_string()];

@@ -88,7 +88,7 @@ inline U256 u256_sub(thread const U256& a, thread const U256& b) {
     return r;
 }
 
-inline U256 u256_mul(thread const U256& a, thread const U256& b) {
+inline U256 u256_mul(U256 a, U256 b) {
     uint32_t r[16] = {0};
     for (int i = 0; i < 8; ++i) {
         uint64_t carry = 0;
@@ -187,28 +187,32 @@ inline U256 u256_sqr(thread const U256& a) {
     return u256_mul(a, a);
 }
 
-constant uint32_t P_MINUS_2[8] = {
-    0xFFFFFC2D, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
-    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
-};
+inline U256 u256_square_n(U256 value, uint count) {
+    for (uint i = 0; i < count; ++i) value = u256_sqr(value);
+    return value;
+}
 
-// Modular inverse via addition chain / exponentiation a^(P-2) mod P
+// Fixed addition chain: xN = a^(2^N - 1). This uses 255 squares and 15
+// multiplications instead of 256 squares and 249 multiplications per candidate.
 inline U256 u256_inv(thread const U256& a) {
-    U256 res;
-    for (int i = 0; i < 8; ++i) res.d[i] = (i == 0) ? 1 : 0;
-    U256 base = a;
+    U256 x2 = u256_sqr(a); x2 = u256_mul(x2, a);
+    U256 x3 = u256_sqr(x2); x3 = u256_mul(x3, a);
+    U256 x6 = u256_square_n(x3, 3); x6 = u256_mul(x6, x3);
+    U256 x9 = u256_square_n(x6, 3); x9 = u256_mul(x9, x3);
+    U256 x11 = u256_square_n(x9, 2); x11 = u256_mul(x11, x2);
+    U256 x22 = u256_square_n(x11, 11); x22 = u256_mul(x22, x11);
+    U256 x44 = u256_square_n(x22, 22); x44 = u256_mul(x44, x22);
+    U256 x88 = u256_square_n(x44, 44); x88 = u256_mul(x88, x44);
+    U256 x176 = u256_square_n(x88, 88); x176 = u256_mul(x176, x88);
+    U256 x220 = u256_square_n(x176, 44); x220 = u256_mul(x220, x44);
+    U256 x223 = u256_square_n(x220, 3); x223 = u256_mul(x223, x3);
 
-    for (int i = 0; i < 8; ++i) {
-        uint32_t limb = P_MINUS_2[i];
-        for (int b = 0; b < 32; ++b) {
-            if (limb & 1) {
-                res = u256_mul(res, base);
-            }
-            base = u256_sqr(base);
-            limb >>= 1;
-        }
-    }
-    return res;
+    U256 result = u256_square_n(x223, 23); result = u256_mul(result, x22);
+    result = u256_square_n(result, 5); result = u256_mul(result, a);
+    result = u256_square_n(result, 3); result = u256_mul(result, x2);
+    result = u256_square_n(result, 2); result = u256_mul(result, a);
+    // Final exponent: 2^256 - 2^32 - 979 = P - 2. Zero remains zero.
+    return result;
 }
 
 // ==============================================================================

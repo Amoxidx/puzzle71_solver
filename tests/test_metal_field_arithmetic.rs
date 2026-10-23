@@ -28,6 +28,15 @@ kernel void diagnostic_field_square(
     U256 input = inputs[tid];
     outputs[tid] = u256_sqr(input);
 }
+
+kernel void diagnostic_field_inverse(
+    device const U256* inputs [[buffer(0)]],
+    device U256* outputs [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    U256 input = inputs[tid];
+    outputs[tid] = u256_inv(input);
+}
 "#;
 
 fn canonical_sub(delta: u64) -> U256 {
@@ -42,13 +51,17 @@ fn canonical_sub(delta: u64) -> U256 {
 
 fn from_msl(value: &MslU256) -> U256 {
     let mut limbs = [0u64; 4];
-    for i in 0..4 {
-        limbs[i] = value.d[i * 2] as u64 | ((value.d[i * 2 + 1] as u64) << 32);
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        *limb = value.d[i * 2] as u64 | ((value.d[i * 2 + 1] as u64) << 32);
     }
     U256(limbs)
 }
 
 fn squares_on_gpu(inputs: &[U256]) -> Vec<U256> {
+    field_on_gpu(inputs, "diagnostic_field_square")
+}
+
+fn field_on_gpu(inputs: &[U256], kernel_name: &str) -> Vec<U256> {
     assert!(
         !inputs.is_empty(),
         "diagnostic dispatch needs at least one input"
@@ -70,8 +83,8 @@ fn squares_on_gpu(inputs: &[U256]) -> Vec<U256> {
         .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
         .expect("diagnostic shader must compile against the production field arithmetic");
     let function = library
-        .newFunctionWithName(&NSString::from_str("diagnostic_field_square"))
-        .expect("appended diagnostic_field_square kernel must be present");
+        .newFunctionWithName(&NSString::from_str(kernel_name))
+        .expect("appended diagnostic kernel must be present");
     let pipeline = device
         .newComputePipelineStateWithFunction_error(&function)
         .expect("diagnostic pipeline must build");
@@ -225,6 +238,47 @@ fn metal_squares_of_deterministic_canonical_values_match_cpu() {
             *got,
             input.field_square(),
             "GPU square of {input} diverged from the CPU reduction"
+        );
+    }
+}
+
+#[test]
+fn metal_inverse_chain_matches_cpu_and_multiplies_back_to_one() {
+    let mut inputs = vec![
+        U256::ZERO,
+        U256::ONE,
+        U256::from_u64(2),
+        U256::from_u64(977),
+        canonical_sub(1),
+        canonical_sub(65537),
+        canonical_sub(100_000),
+        canonical_sub(4_294_968_272),
+    ];
+    let mut state = 0x4c1f_f03b_ba9d_7147u64;
+    for _ in 0..32 {
+        let mut limbs = [0u64; 4];
+        for limb in &mut limbs {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *limb = state;
+        }
+        let mut value = U256(limbs);
+        if value.gte(&SECP256K1_P) {
+            value = value.sub_borrow(&SECP256K1_P).0;
+        }
+        inputs.push(value);
+    }
+    let inverses = field_on_gpu(&inputs, "diagnostic_field_inverse");
+    for (input, inverse) in inputs.iter().zip(inverses) {
+        assert_eq!(inverse, input.field_inv(), "inverse mismatch for {input}");
+        assert_eq!(
+            input.field_mul(&inverse),
+            if input.is_zero() {
+                U256::ZERO
+            } else {
+                U256::ONE
+            }
         );
     }
 }

@@ -1,8 +1,9 @@
 //! Dual-source Esplora UTXO fetch with raw-transaction verification.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use bitcoin::hex::FromHex;
 use bitcoin::{OutPoint, Txid};
@@ -18,6 +19,38 @@ use crate::puzzle_config::{TARGET_ADDRESS, TARGET_HASH160};
 
 const BASES: [&str; 2] = ["https://mempool.space", "https://blockstream.info"];
 const TIMEOUT_SECS: u64 = 30;
+const MAX_RAW_CACHE_ENTRIES: usize = 128;
+const MAX_RAW_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+type ConfirmedSet = BTreeSet<(String, u32, u64)>;
+
+#[derive(Default)]
+struct RawTxCache {
+    transactions: BTreeMap<String, Vec<u8>>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl RawTxCache {
+    fn insert(&mut self, txid: &str, raw: &[u8]) {
+        if raw.len() > MAX_RAW_CACHE_BYTES || self.transactions.contains_key(txid) {
+            return;
+        }
+        while self.transactions.len() >= MAX_RAW_CACHE_ENTRIES
+            || self.bytes.saturating_add(raw.len()) > MAX_RAW_CACHE_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.transactions.remove(&oldest) {
+                self.bytes -= removed.len();
+            }
+        }
+        self.transactions.insert(txid.to_string(), raw.to_vec());
+        self.order.push_back(txid.to_string());
+        self.bytes += raw.len();
+    }
+}
 
 /// Independently verified confirmed previous outputs plus a count of unconfirmed UTXOs seen.
 #[derive(Clone, Debug)]
@@ -65,11 +98,15 @@ pub trait UtxoSource {
 /// confirmed sets to agree, then loads each unique previous transaction and verifies it.
 pub struct EsploraUtxoSource<T: Transport> {
     transport: T,
+    raw_cache: Mutex<RawTxCache>,
 }
 
 impl<T: Transport> EsploraUtxoSource<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            raw_cache: Mutex::new(RawTxCache::default()),
+        }
     }
 
     fn get(&self, url: &str) -> Result<crate::claim::net::http::HttpResponse, NetError> {
@@ -103,10 +140,26 @@ impl<T: Transport> EsploraUtxoSource<T> {
     }
 
     fn load_raw_tx(&self, txid: &str) -> Result<Vec<u8>, ClaimFetchError> {
-        match self.fetch_and_require(BASES[0], txid) {
-            Ok(bytes) => Ok(bytes),
-            Err(_) => self.fetch_and_require(BASES[1], txid),
+        if let Some(raw) = self
+            .raw_cache
+            .lock()
+            .map_err(|_| NetError::BadResponse)?
+            .transactions
+            .get(txid)
+            .cloned()
+        {
+            return Ok(raw);
         }
+        let raw = match self.fetch_and_require(BASES[0], txid) {
+            Ok(bytes) => bytes,
+            Err(_) => self.fetch_and_require(BASES[1], txid)?,
+        };
+        // Only bytes whose independently recomputed txid matches enter this immutable cache.
+        self.raw_cache
+            .lock()
+            .map_err(|_| NetError::BadResponse)?
+            .insert(txid, &raw);
+        Ok(raw)
     }
 
     fn fetch_and_require(&self, base: &str, txid: &str) -> Result<Vec<u8>, ClaimFetchError> {
@@ -159,7 +212,7 @@ impl<T: Transport> UtxoSource for EsploraUtxoSource<T> {
             let outpoint = OutPoint { txid, vout: *vout };
             let raw = raw_by_txid.get(txid_key).ok_or(NetError::BadResponse)?;
             let verified = verify_prevout(outpoint, raw, script.as_script())?;
-            if verified.txout.value.to_sat() != *value {
+            if verified.txout().value.to_sat() != *value {
                 return Err(NetError::SourceValueMismatch.into());
             }
             prevouts.push(verified);
@@ -189,9 +242,7 @@ struct EsploraStatus {
     confirmed: Option<bool>,
 }
 
-fn unique_confirmed(
-    list: &[EsploraUtxo],
-) -> Result<(BTreeSet<(String, u32, u64)>, usize), NetError> {
+fn unique_confirmed(list: &[EsploraUtxo]) -> Result<(ConfirmedSet, usize), NetError> {
     let mut by_outpoint: BTreeMap<(String, u32), u64> = BTreeMap::new();
     let mut unconfirmed = 0usize;
     for utxo in list {
@@ -230,15 +281,20 @@ mod tests {
         Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute,
         consensus, transaction,
     };
+    use std::cell::RefCell;
     use std::collections::HashMap;
 
     struct FakeTransport {
         routes: HashMap<String, Result<HttpResponse, NetError>>,
+        calls: RefCell<Vec<String>>,
     }
 
     impl FakeTransport {
         fn new(routes: HashMap<String, Result<HttpResponse, NetError>>) -> Self {
-            Self { routes }
+            Self {
+                routes,
+                calls: RefCell::new(Vec::new()),
+            }
         }
     }
 
@@ -250,6 +306,7 @@ mod tests {
             _json_body: Option<&str>,
             _timeout_secs: u64,
         ) -> Result<HttpResponse, NetError> {
+            self.calls.borrow_mut().push(url.to_string());
             self.routes
                 .get(url)
                 .cloned()
@@ -318,6 +375,145 @@ mod tests {
     }
 
     #[test]
+    fn raw_cache_reuses_verified_bytes_but_refreshes_both_utxo_lists() {
+        let (_, txid, hex) = funding(100_000);
+        let list = utxo_json(&[(&txid, 0, 100_000, true)]);
+        let mut routes = HashMap::new();
+        for base in BASES {
+            routes.insert(utxo_url(base), route_ok(&list));
+        }
+        routes.insert(hex_url(BASES[0], &txid), route_ok(&hex));
+        let mut source = EsploraUtxoSource::new(FakeTransport::new(routes));
+        let first = source.fetch_verified_prevouts().unwrap();
+        assert_eq!(first.prevouts[0].txout().value.to_sat(), 100_000);
+        assert_eq!(source.transport.calls.borrow().len(), 3);
+        source.transport.calls.borrow_mut().clear();
+        let second = source.fetch_verified_prevouts().unwrap();
+        assert_eq!(second.prevouts[0].outpoint(), first.prevouts[0].outpoint());
+        assert_eq!(
+            source.transport.calls.borrow().as_slice(),
+            &[utxo_url(BASES[0]), utxo_url(BASES[1])]
+        );
+
+        // A new member loads only its funding transaction; existing bytes stay reusable.
+        let (_, new_txid, new_hex) = funding(200_000);
+        let list = utxo_json(&[(&txid, 0, 100_000, true), (&new_txid, 0, 200_000, true)]);
+        for base in BASES {
+            source
+                .transport
+                .routes
+                .insert(utxo_url(base), route_ok(&list));
+        }
+        source
+            .transport
+            .routes
+            .insert(hex_url(BASES[0], &new_txid), route_ok(&new_hex));
+        source.transport.calls.borrow_mut().clear();
+        assert_eq!(source.fetch_verified_prevouts().unwrap().prevouts.len(), 2);
+        let calls = source.transport.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|url| url.ends_with("/hex"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![hex_url(BASES[0], &new_txid)]
+        );
+        drop(calls);
+
+        // Membership is never cached, including disappearance of every output.
+        for base in BASES {
+            source
+                .transport
+                .routes
+                .insert(utxo_url(base), route_ok("[]"));
+        }
+        source.transport.calls.borrow_mut().clear();
+        assert!(
+            source
+                .fetch_verified_prevouts()
+                .unwrap()
+                .prevouts
+                .is_empty()
+        );
+        assert_eq!(source.transport.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn cached_raw_bytes_do_not_trust_changed_amounts_or_disagreeing_membership() {
+        let (_, txid, hex) = funding(100_000);
+        let list = utxo_json(&[(&txid, 0, 100_000, true)]);
+        let mut routes = HashMap::new();
+        for base in BASES {
+            routes.insert(utxo_url(base), route_ok(&list));
+        }
+        routes.insert(hex_url(BASES[0], &txid), route_ok(&hex));
+        let mut source = EsploraUtxoSource::new(FakeTransport::new(routes));
+        source.fetch_verified_prevouts().unwrap();
+        let wrong = utxo_json(&[(&txid, 0, 100_001, true)]);
+        for base in BASES {
+            source
+                .transport
+                .routes
+                .insert(utxo_url(base), route_ok(&wrong));
+        }
+        assert!(matches!(
+            source.fetch_verified_prevouts(),
+            Err(ClaimFetchError::Net(NetError::SourceValueMismatch))
+        ));
+        source
+            .transport
+            .routes
+            .insert(utxo_url(BASES[1]), route_ok("[]"));
+        assert!(matches!(
+            source.fetch_verified_prevouts(),
+            Err(ClaimFetchError::Net(NetError::SourcesDisagree))
+        ));
+    }
+
+    #[test]
+    fn invalid_raw_transaction_is_not_cached_and_can_be_retried() {
+        let (_, txid, hex) = funding(100_000);
+        let (_, _, wrong_hex) = funding(100_001);
+        let list = utxo_json(&[(&txid, 0, 100_000, true)]);
+        let mut routes = HashMap::new();
+        for base in BASES {
+            routes.insert(utxo_url(base), route_ok(&list));
+            routes.insert(hex_url(base, &txid), route_ok(&wrong_hex));
+        }
+        let mut source = EsploraUtxoSource::new(FakeTransport::new(routes));
+        assert!(source.fetch_verified_prevouts().is_err());
+        assert!(source.raw_cache.lock().unwrap().transactions.is_empty());
+        source
+            .transport
+            .routes
+            .insert(hex_url(BASES[0], &txid), route_ok(&hex));
+        source.transport.calls.borrow_mut().clear();
+        assert_eq!(source.fetch_verified_prevouts().unwrap().prevouts.len(), 1);
+        assert_eq!(source.transport.calls.borrow().len(), 3);
+    }
+
+    #[test]
+    fn raw_transaction_cache_bounds_entry_count_and_bytes() {
+        let mut cache = super::RawTxCache::default();
+        for n in 0..=super::MAX_RAW_CACHE_ENTRIES {
+            cache.insert(&n.to_string(), &[1, 2]);
+        }
+        assert_eq!(cache.transactions.len(), super::MAX_RAW_CACHE_ENTRIES);
+        assert!(!cache.transactions.contains_key("0"));
+        assert_eq!(cache.bytes, super::MAX_RAW_CACHE_ENTRIES * 2);
+        let half = vec![0; super::MAX_RAW_CACHE_BYTES / 2];
+        cache.insert("large-a", &half);
+        cache.insert("large-b", &half);
+        assert_eq!(cache.bytes, super::MAX_RAW_CACHE_BYTES);
+        assert_eq!(cache.transactions.len(), 2);
+        cache.insert("oversized", &vec![0; super::MAX_RAW_CACHE_BYTES + 1]);
+        assert_eq!(cache.bytes, super::MAX_RAW_CACHE_BYTES);
+        assert!(!cache.transactions.contains_key("oversized"));
+    }
+
+    #[test]
     fn success_fetches_both_sources_and_verifies_prevouts() {
         let (_tx, txid, hex) = funding(100_000);
         let list = utxo_json(&[(&txid, 0, 100_000, true)]);
@@ -329,7 +525,7 @@ mod tests {
         let source = EsploraUtxoSource::new(FakeTransport::new(routes));
         let snapshot = source.fetch_verified_prevouts().expect("agreeing sources");
         assert_eq!(snapshot.prevouts.len(), 1);
-        assert_eq!(snapshot.prevouts[0].txout.value.to_sat(), 100_000);
+        assert_eq!(snapshot.prevouts[0].txout().value.to_sat(), 100_000);
         assert_eq!(snapshot.unconfirmed_count, 0);
     }
 
@@ -362,7 +558,7 @@ mod tests {
         let snapshot = source
             .fetch_verified_prevouts()
             .expect("source 2 must rescue");
-        assert_eq!(snapshot.prevouts[0].txout.value.to_sat(), 100_000);
+        assert_eq!(snapshot.prevouts[0].txout().value.to_sat(), 100_000);
     }
 
     #[test]
@@ -430,7 +626,7 @@ mod tests {
         let source = EsploraUtxoSource::new(FakeTransport::new(routes));
         let snapshot = source.fetch_verified_prevouts().expect("429 fallback");
         assert_eq!(snapshot.prevouts.len(), 1);
-        assert_eq!(snapshot.prevouts[0].txout.value.to_sat(), 100_000);
+        assert_eq!(snapshot.prevouts[0].txout().value.to_sat(), 100_000);
     }
 
     #[test]
@@ -479,7 +675,7 @@ mod tests {
         let source = EsploraUtxoSource::new(FakeTransport::new(routes));
         let snapshot = source.fetch_verified_prevouts().expect("deduped");
         assert_eq!(snapshot.prevouts.len(), 1);
-        assert_eq!(snapshot.prevouts[0].txout.value.to_sat(), 100_000);
+        assert_eq!(snapshot.prevouts[0].txout().value.to_sat(), 100_000);
     }
 
     #[test]
@@ -539,17 +735,17 @@ mod tests {
         let values: Vec<u64> = snapshot
             .prevouts
             .iter()
-            .map(|p| p.txout.value.to_sat())
+            .map(|p| p.txout().value.to_sat())
             .collect();
         assert!(values.contains(&80_000), "{values:?}");
         assert!(values.contains(&20_000), "{values:?}");
         assert_eq!(
-            snapshot.prevouts[0].outpoint.txid,
-            snapshot.prevouts[1].outpoint.txid
+            snapshot.prevouts[0].outpoint().txid,
+            snapshot.prevouts[1].outpoint().txid
         );
         assert_ne!(
-            snapshot.prevouts[0].outpoint.vout,
-            snapshot.prevouts[1].outpoint.vout
+            snapshot.prevouts[0].outpoint().vout,
+            snapshot.prevouts[1].outpoint().vout
         );
     }
 
@@ -568,10 +764,10 @@ mod tests {
         let mut total_sat = 0u64;
         for prevout in &snapshot.prevouts {
             assert_eq!(
-                prevout.txout.script_pubkey.as_script(),
+                prevout.txout().script_pubkey.as_script(),
                 expected_script.as_script()
             );
-            total_sat += prevout.txout.value.to_sat();
+            total_sat += prevout.txout().value.to_sat();
         }
         assert!(
             total_sat >= MIN_EXPECTED_ECONOMIC_TOTAL_SAT,

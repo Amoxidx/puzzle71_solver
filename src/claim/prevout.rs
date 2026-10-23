@@ -15,14 +15,36 @@ use crate::claim::error::ClaimError;
 /// A previous output whose amount and script have been checked against the raw previous
 /// transaction bytes and an expected outpoint/script.
 ///
-/// Only constructible via [`verify_prevout`] — the private `_sealed` field prevents struct-
-/// literal construction from outside this function, while `outpoint` and `txout` stay `pub`
-/// for direct read access.
+/// Only constructible via [`verify_prevout`]. Read-only accessors preserve the checked
+/// relationship between the funding transaction, outpoint, script and amount.
+///
+/// ```compile_fail
+/// use puzzle71_solver::claim::VerifiedPrevout;
+/// fn change_amount(mut prevout: VerifiedPrevout) {
+///     prevout.txout.value = bitcoin::Amount::from_sat(1);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use puzzle71_solver::claim::VerifiedPrevout;
+/// fn change_outpoint(mut prevout: VerifiedPrevout) {
+///     prevout.outpoint.vout = 7;
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct VerifiedPrevout {
-    pub outpoint: OutPoint,
-    pub txout: TxOut,
-    _sealed: (),
+    outpoint: OutPoint,
+    txout: TxOut,
+}
+
+impl VerifiedPrevout {
+    pub fn outpoint(&self) -> OutPoint {
+        self.outpoint
+    }
+
+    pub fn txout(&self) -> &TxOut {
+        &self.txout
+    }
 }
 
 /// Deserializes `raw_prev_tx` (legacy or segwit encoding — `consensus::deserialize` handles
@@ -54,7 +76,6 @@ pub fn verify_prevout(
     Ok(VerifiedPrevout {
         outpoint: expected,
         txout: txout.clone(),
-        _sealed: (),
     })
 }
 
@@ -118,8 +139,34 @@ mod tests {
         };
 
         let verified = verify_prevout(expected, &raw, &test_script()).unwrap();
-        assert_eq!(verified.outpoint, expected);
-        assert_eq!(verified.txout.value, Amount::from_sat(100_000));
+        assert_eq!(verified.outpoint(), expected);
+        assert_eq!(verified.txout().value, Amount::from_sat(100_000));
+    }
+
+    #[test]
+    fn accessor_copies_cannot_change_verified_amount_script_or_outpoint() {
+        let script = test_script();
+        let tx = funding_tx(
+            vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: script.clone(),
+            }],
+            false,
+        );
+        let expected = OutPoint {
+            txid: tx.compute_txid(),
+            vout: 0,
+        };
+        let verified = verify_prevout(expected, &consensus::serialize(&tx), &script).unwrap();
+        let mut copied_outpoint = verified.outpoint();
+        copied_outpoint.vout = 9;
+        let mut copied_txout = verified.txout().clone();
+        copied_txout.value = Amount::from_sat(1);
+        copied_txout.script_pubkey = ScriptBuf::new();
+        assert_ne!(copied_outpoint, verified.outpoint());
+        assert_ne!(&copied_txout, verified.txout());
+        assert_eq!(verified.outpoint(), expected);
+        assert_eq!(verified.txout(), &tx.output[0]);
     }
 
     #[test]

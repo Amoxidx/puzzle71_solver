@@ -16,17 +16,34 @@ Das ist ein Brute-Force-Suchprogramm, keine Ertrags- oder Gewinnzusage. Ein Tref
 
 Der Hauptsuchlauf benötigt ein erfolgreich initialisiertes Metal-Gerät. Der CPU-Code dient unter anderem der Kryptografie, dem Mini-Puzzle-Selbsttest und der unabhängigen Trefferprüfung; ein CPU-Fallback für die vollständige Suche ist nicht implementiert.
 
+## Auszahlung an deine Wallet
+
+Nach einem verifizierten und dauerhaft lokal gespeicherten Treffer gibst du im Dashboard die Empfangsadresse deiner Bitcoin-Wallet ein. „Adresse prüfen“ lädt aktuelle UTXOs aus zwei unabhängigen Quellen und zeigt die vollständige Zieladresse, Auszahlung und Gebühr. Erst „Transaktion an MARA Slipstream senden“ reicht genau diese Vorschau ein. Es gibt keinen Telegram-Code und keine Hardware-Wallet-Pflicht. Eine Eingabe, Vorbereitung oder ein Neustart sendet keine Transaktion.
+
+Änderst du die Adresse, bereitest erneut vor oder ändert ein anderer Tab die Vorschau, musst du die neue Vorschau erneut prüfen. Vor dem Senden werden UTXOs und Mindestgebühr erneut abgefragt. Unveränderliche, anhand ihrer Transaktions-ID geprüfte Finanzierungstransaktionen werden begrenzt zwischengespeichert; die aktuellen UTXO-Listen werden nie aus diesem Cache übernommen. Bei einer unklaren Einreichung bleibt `CLAIM_SUBMITTED.json` als Schutz vor einer abweichenden zweiten Transaktion bestehen. „Eingereicht“ bedeutet noch keine Blockbestätigung. Die tatsächliche Verfügbarkeit und Verarbeitung bei MARA ist damit nicht garantiert.
+
+Kann ein bestätigter Treffer noch nicht dauerhaft gespeichert werden, hält der Solver den Schlüssel im Speicher und wiederholt die Speicherung. Das Dashboard zeigt „Speicherung wird wiederholt“ und sperrt die Auszahlung bis zum Erfolg. Den Prozess währenddessen nicht beenden; noch nicht gespeicherte Daten überleben keinen Prozessabbruch.
+
+Eine isolierte Generalprobe nutzt denselben Claim-Dienst mit einem bekannten öffentlichen Testschlüssel, Regtest-Adressen und ausschließlich lokalem Bitcoin-Core-RPC:
+
+```bash
+cargo run --bin rehearsal -- write-hit --dir /tmp/p71-regtest-probe
+cargo run --bin rehearsal -- serve-regtest --dir /tmp/p71-regtest-probe --rpc 127.0.0.1:18543 --port 18080
+```
+
+Das Verzeichnis muss vorher frisch angelegt und die ausgegebene Regtest-Puzzle-Adresse mit lokalen Test-Coins finanziert und bestätigt sein. Der Server prüft das Netz des RPC-Knotens und startet nur bei `regtest`. Er hat keinen Telegram- oder Mainnet-Einreichpfad. Im Browser kann anschließend eine Regtest-Empfangsadresse eingegeben, die Vorschau geprüft und die Testtransaktion ausdrücklich gesendet werden.
+
 ## Bauen und starten
 
 Im Repository-Root:
 
 ```sh
 cargo build --release
-cargo run --release -- --help
-cargo run --release -- --mode auto
+cargo run --release --bin puzzle71_solver -- --help
+cargo run --release --bin puzzle71_solver -- --mode auto
 ```
 
-Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtenden CPU-Kryptografie- und Mini-Puzzle-Selbsttest mit einem 24-Bit-Schlüssel aus. Dieser prüft nicht den vollständigen Suchraum von `2^24` Schlüsseln und ersetzt keinen GPU-Test. Danach startet es den Solver und das Dashboard. Die separaten Modi `--bench`, `--test-mini` und `--telegram-test` führen ihre jeweilige Aufgabe aus und beenden sich anschließend. Das kompilierte Programm liegt nach dem Release-Build unter `target/release/puzzle71_solver`.
+Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtenden CPU-Kryptografie- und Mini-Puzzle-Selbsttest mit einem 24-Bit-Schlüssel aus. Dieser prüft nicht den vollständigen Suchraum von `2^24` Schlüsseln und ersetzt keinen GPU-Test. Vor der eigentlichen Suche prüft ein zusätzlicher Metal-Selbsttest deshalb einen unabhängig mit libsecp256k1 abgeleiteten Zielschlüssel im Puzzle-Bereich. Schlägt er fehl, startet die Suche nicht. Die separaten Modi `--bench`, `--test-mini` und `--telegram-test` führen ihre jeweilige Aufgabe aus und beenden sich anschließend. Das kompilierte Programm liegt nach dem Release-Build unter `target/release/puzzle71_solver`.
 
 ### Unterstützte Optionen
 
@@ -49,21 +66,21 @@ Beispiele:
 
 ```sh
 # Dashboard ohne ANSI-Terminalanzeige
-cargo run --release -- --mode balanced --no-tui
+cargo run --release --bin puzzle71_solver -- --mode balanced --no-tui
 
 # Anderen lokalen Port verwenden
-cargo run --release -- --host 127.0.0.1 --port 9090
+cargo run --release --bin puzzle71_solver -- --host 127.0.0.1 --port 9090
 
 # Nur die lokalen Prüfungen beziehungsweise den Benchmark ausführen
-cargo run --release -- --test-mini
-cargo run --release -- --electricity-price 0.34 --bench
+cargo run --release --bin puzzle71_solver -- --test-mini
+cargo run --release --bin puzzle71_solver -- --electricity-price 0.34 --bench
 ```
 
 ## Dashboard
 
 Standardmäßig ist das Dashboard unter [http://127.0.0.1:8080](http://127.0.0.1:8080) erreichbar. Es wird zusammen mit dem Solver gestartet und zeigt unter anderem Laufstatus, Power-Modus, Keys/s, geprüfte Blöcke, Laufzeit, geschätzte Package-Power, geschätzte SoC-Temperatur, CPU-Last, GPU-Duty-Limit und den Zeitpunkt des letzten Checkpoints.
 
-Die Oberfläche kann die Suche pausieren/fortsetzen, den Power-Modus ändern und den CPU-Selbsttest auslösen. Die eingebettete HTTP-API stellt lokale Status- und Steuerpfade bereit (`/api/status`, `/api/start`, `/api/stop`, `/api/mode`, `/api/selftest`). Bei einem verifizierten Treffer kommen die Claim-Pfade für Vorbereitung, Bestätigung und erneuten Code-Versand hinzu. Für POST-Anfragen wird zusätzlich eine passende lokale Origin geprüft. Es gibt keine Anmeldung, keine TLS-Schicht und keine Berechtigungstrennung: Wer Zugriff auf den lokalen Dienst hat, kann ihn steuern. Das Dashboard darf deshalb nicht über einen Proxy oder eine öffentliche Netzwerkschnittstelle exponiert werden.
+Die Oberfläche kann die Suche pausieren/fortsetzen, den Power-Modus ändern und den CPU-Selbsttest auslösen. Die eingebettete HTTP-API stellt lokale Status- und Steuerpfade bereit (`/api/status`, `/api/start`, `/api/stop`, `/api/mode`, `/api/selftest`). Bei einem verifizierten Treffer kommen die Claim-Pfade für Vorbereitung und ausdrückliches Senden hinzu. Für POST-Anfragen wird zusätzlich eine passende lokale Origin geprüft. Es gibt keine Anmeldung, keine TLS-Schicht und keine Berechtigungstrennung: Wer Zugriff auf den lokalen Dienst hat, kann ihn steuern. Das Dashboard darf deshalb nicht über einen Proxy oder eine öffentliche Netzwerkschnittstelle exponiert werden.
 
 ## Power-Modi und Duty-Limit
 
@@ -81,19 +98,25 @@ Die Power- und Temperaturwerte im Dashboard sind Schätzwerte aus Prozess-/Syste
 
 ## Checkpoints und Fortsetzen
 
-Der Standard-Checkpoint heißt `puzzle71_checkpoint.json` und liegt im aktuellen Arbeitsverzeichnis. Der Solver speichert während des Laufs periodisch (alle zehn Sekunden), beim Pausieren und beim kontrollierten Beenden. Geschrieben wird über temporäre Datei, `fsync` und atomisches Umbenennen; die Datei erhält Unix-Rechte `0600`.
+Der Standard-Checkpoint heißt `puzzle71_checkpoint.json` und liegt im aktuellen Arbeitsverzeichnis. Bestehende JSON-Checkpoints bleiben lesbar. Neue vollständige Blöcke werden mit `fsync` in `puzzle71_checkpoint.journal` protokolliert; Laufzeit-Updates erfolgen etwa alle zehn Sekunden sowie beim Pausieren und kontrollierten Beenden. Beide Dateien erhalten Unix-Rechte `0600`. Eine exklusive Datei-Sperre verhindert zwei aktuelle Solver-Instanzen im selben Arbeitsverzeichnis.
 
-Gespeichert werden Puzzle-Nummer, Laufzeit, Zähler und sortierte, nicht überlappende Intervalle vollständig geprüfter Blöcke. Beim nächsten Start wird der Checkpoint geladen, auf Puzzle #71 und die gewählte Blockgröße validiert und zur Fortsetzung verwendet. Ungültige oder inkonsistente Daten werden nicht stillschweigend ignoriert; der Start bricht mit einem Fehler ab. Ein laufender Block wird erst nach vollständigem Abschluss dauerhaft als abgedeckt markiert.
+Ein vollständiger JSON-Snapshot wird stündlich oder bei einem Journal von mindestens 1 MiB erstellt. Erst nach Synchronisierung der neuen Datei und ihres Verzeichnisses wird das Journal gekürzt. Dadurch wird die wachsende Intervallliste nicht mehr alle zehn Sekunden vollständig neu geschrieben. Für Sicherungen und Übertragungen gehören Snapshot und Journal zusammen; den laufenden Solver vorher kontrolliert beenden.
+
+Beim Start werden Puzzle, Suchbereich, Blockgröße, Zähler und Journal-Prüfsummen validiert. Bereits übernommene Journal-Blöcke werden nicht doppelt gezählt. Ein unvollständiger letzter Datensatz wird konservativ entfernt; vollständige beschädigte Datensätze führen zu einem Fehler. Ein laufender Block wird erst nach vollständigem Abschluss dauerhaft als abgedeckt markiert.
+
+Ein übernommener alter Checkpoint belegt weiterhin nur die damals gezählte Suchhistorie. Die korrigierte Metal-Feldarithmetik prüft diese früheren Kandidaten nicht rückwirkend erneut. Für eine vollständige erneute Prüfung ein frisches Arbeitsverzeichnis verwenden und die bisherige Historie getrennt sichern.
 
 ## Trefferverhalten und Geheimnisse
 
 Bei einem Metal-Kandidaten stoppt der Suchlauf und leitet eine unabhängige, reine CPU-Verifikation der Adresse und des HASH160 ein. Nur bei erfolgreicher Prüfung wird die private Information lokal in `FOUND_KEY.txt` (oder einem kollisionsfreien Fallback-Namen) mit `0600` gespeichert. Bestehende Trefferdateien werden nicht überschrieben.
 
+Ein Speicherfehler verwirft den bestätigten Kandidaten nicht: Der Prozess behält ihn geschützt im Speicher und wiederholt die Speicherung. Währenddessen zeigt das Dashboard den ausstehenden Speichervorgang und sperrt die Auszahlung. Vollständige sichere Tempdateien werden beim nächsten Start unabhängig verifiziert und erneut gespeichert. Kontrolliertes Beenden wartet auf erfolgreiche Speicherung. Ein erzwungenes Prozessende bei dauerhaft nicht verfügbarem Speicher bleibt eine Grenze dieser Wiederherstellung.
+
 Die Web-API und der Dashboard-Status enthalten bei einem Treffer ausschließlich öffentliche Treffer- und Claim-Informationen — niemals den Private Key oder die signierte Transaktion. Checkpoints enthalten keine privaten Schlüssel. Trotzdem ist das Arbeitsverzeichnis vertraulich zu behandeln: `FOUND_KEY.txt` enthält den Private Key im Klartext. Nicht hochladen, nicht teilen und nicht in Logs, Screenshots oder Backups ohne geeignete Schutzmaßnahmen übernehmen. Eine manuelle Weiterverwendung des Schlüssels sollte offline erfolgen. Der eingebaute Claim-Pfad benötigt Netzwerkzugriff und reicht die signierte Transaktion ausschließlich bei MARA Slipstream ein.
 
 ## Sicherheits- und Privacy-Grenzen
 
-- Die Suche und das Dashboard können lokal ohne externe Netzwerkverbindung arbeiten. Der Gesamtprozess ist nicht vollständig offline: Bei einem verifizierten Treffer versucht er einen Telegram-Alert; Claim-Vorbereitung, Einreichung und Statusabfragen verwenden externe Dienste. Eine Einreichung erfolgt erst nach ausdrücklicher Bestätigung im Dashboard.
+- Die Suche und das Dashboard können lokal ohne externe Netzwerkverbindung arbeiten. Der Gesamtprozess ist nicht vollständig offline: Claim-Vorbereitung, Einreichung und Statusabfragen verwenden externe Dienste. Der separate optionale Aufruf `--telegram-test` sendet eine Testnachricht; die Auszahlung benötigt keine Telegram-Konfiguration. Eine Einreichung erfolgt erst nach ausdrücklicher Bestätigung im Dashboard.
 - Der Claim-Pfad gleicht UTXOs über mempool.space und blockstream.info ab und reicht ausschließlich bei MARA Slipstream ein. Die Privatsphäre der Einreichung hängt auch vom Verhalten dieses Providers ab. Private Keys werden dafür nicht übertragen; die signierte Transaktion enthält den öffentlichen Schlüssel.
 - Loopback-Bindung und lokale Origin-Prüfung reduzieren die Angriffsfläche, ersetzen aber keine Authentifizierung oder TLS.
 - Der Prozess vertraut den Dateirechten und der Sicherheit des macOS-Benutzerkontos. Andere Prozesse mit ausreichenden lokalen Rechten können Dateien oder Prozessdaten weiterhin lesen.
@@ -128,7 +151,7 @@ Die Tests decken unter anderem Hash-/Adressvektoren, den 24-Bit-Mini-Puzzle-End-
 Für die Dashboard-Tests muss der Solver separat laufen. Die Suite startet ihn nicht selbst:
 
 ```sh
-cargo run --release -- --host 127.0.0.1 --port 8080 --no-tui
+cargo run --release --bin puzzle71_solver -- --host 127.0.0.1 --port 8080 --no-tui
 cd web-tests
 npm install
 npx playwright install chromium

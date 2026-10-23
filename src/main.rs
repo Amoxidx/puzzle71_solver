@@ -5,20 +5,23 @@
 
 use puzzle71_solver::bench::run_comprehensive_benchmark;
 use puzzle71_solver::claim::{
-    ClaimService, ClaimState, CurlTransport, EsploraUtxoSource, FoundKeyFile, SlipstreamSubmitter,
+    ClaimService, CurlTransport, EsploraUtxoSource, FoundKeyFile, SlipstreamSubmitter,
     TelegramNotifier, find_verified_found_key,
 };
 use puzzle71_solver::crypto::cpu_engine::run_mini_puzzle_test;
-use puzzle71_solver::hit_handler::verify_and_save_candidate;
+use puzzle71_solver::hit_handler::{
+    FOUND_KEY_FILENAME, VerifiedHit, recover_staged_hit, verify_candidate,
+};
 use puzzle71_solver::metal_engine::metal_solver::MetalSolver;
 use puzzle71_solver::power::controller::{PowerGovernor, PowerMode};
 use puzzle71_solver::puzzle_config::{
     RANGE_MAX, RANGE_MIN, RANGE_SIZE, TARGET_ADDRESS, TARGET_HASH160,
 };
 use puzzle71_solver::search::block_progress::BlockProgress;
-use puzzle71_solver::search::checkpoint::{CheckpointState, DEFAULT_CHECKPOINT_FILE};
-use puzzle71_solver::search::duplicate_filter::DuplicateFilter;
+use puzzle71_solver::search::checkpoint::DEFAULT_CHECKPOINT_FILE;
+use puzzle71_solver::search::profile::dispatch_profile;
 use puzzle71_solver::search::rng::select_random_block_start;
+use puzzle71_solver::search::store::{CheckpointLock, CheckpointStore};
 use puzzle71_solver::ui::terminal::SolverStats;
 use puzzle71_solver::web::server::{PublicHitStatus, SharedSolverState, start_web_server};
 
@@ -44,7 +47,10 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--bench" | "benchmark" => {
-                run_comprehensive_benchmark(electricity_price);
+                if let Err(error) = run_comprehensive_benchmark(electricity_price) {
+                    eprintln!("Benchmark failed: {error}");
+                    std::process::exit(1);
+                }
                 return;
             }
             "--test-mini" => {
@@ -140,6 +146,13 @@ fn main() {
     }
     SHUTDOWN_SIGNAL.store(false, Ordering::SeqCst);
 
+    // Protect search progress and recovered claims before either path can write.
+    let checkpoint_lock =
+        CheckpointLock::acquire(DEFAULT_CHECKPOINT_FILE).unwrap_or_else(|error| {
+            eprintln!("CRITICAL: {error}");
+            std::process::exit(1);
+        });
+
     let found_key_scan =
         find_verified_found_key(Path::new("."), TARGET_HASH160, RANGE_MIN..=RANGE_MAX);
     if let Some(found_path) = found_key_scan.found {
@@ -155,39 +168,39 @@ fn main() {
             .join(", ");
         eprintln!("WARNING: FOUND_KEY file present but not loadable ({details})");
     }
+    match recover_staged_hit(Path::new(".")) {
+        Ok(Some(hit)) => {
+            resume_from_staged_hit(&web_host, web_port, hit);
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Cannot inspect recoverable hit files: {error}");
+            std::process::exit(1);
+        }
+    }
 
     // Step 3: Load existing checkpoint if available
-    let mut checkpoint =
-        CheckpointState::load_from_file(DEFAULT_CHECKPOINT_FILE).unwrap_or_else(|e| {
-            eprintln!("CRITICAL: Refusing to ignore invalid checkpoint: {}", e);
-            std::process::exit(1);
-        });
-    checkpoint
-        .validate_for_block_size(block_size)
-        .unwrap_or_else(|e| {
-            eprintln!("CRITICAL: Refusing inconsistent checkpoint: {}", e);
-            eprintln!(
-                "Preserve the file for audit and start with an explicitly repaired checkpoint."
-            );
-            std::process::exit(1);
-        });
-
-    let mut dup_filter = DuplicateFilter::from_intervals(checkpoint.to_interval_set());
+    let mut checkpoint = CheckpointStore::open(checkpoint_lock, block_size).unwrap_or_else(|e| {
+        eprintln!("CRITICAL: Refusing to ignore invalid checkpoint: {}", e);
+        std::process::exit(1);
+    });
     println!(
         "Loaded checkpoint: {} keys previously tested across {} blocks.",
-        checkpoint.total_keys_tested, checkpoint.total_blocks_tested
+        checkpoint.total_keys_tested(),
+        checkpoint.total_blocks_tested()
     );
 
     // Step 4: Setup shared state & launch Localhost Web Dashboard Server
     let shared_state = SharedSolverState::new();
     *shared_state.mode.lock().unwrap() = mode;
-    *shared_state.total_keys_tested.lock().unwrap() = checkpoint.total_keys_tested;
+    *shared_state.total_keys_tested.lock().unwrap() = checkpoint.total_keys_tested();
     shared_state
         .total_blocks_tested
-        .store(checkpoint.total_blocks_tested, Ordering::SeqCst);
+        .store(checkpoint.total_blocks_tested(), Ordering::SeqCst);
     shared_state
         .checkpoint_saved_timestamp
-        .store(checkpoint.last_saved_timestamp, Ordering::SeqCst);
+        .store(checkpoint.last_saved_timestamp(), Ordering::SeqCst);
 
     start_web_server(&web_host, web_port, shared_state.clone()).unwrap_or_else(|e| {
         eprintln!(
@@ -199,16 +212,20 @@ fn main() {
 
     // Step 5: Initialize Metal GPU solver and Power Governor
     let solver = MetalSolver::new().expect("Failed to initialize Metal GPU Solver");
+    solver
+        .self_test()
+        .expect("Independent GPU self-test failed; refusing to search");
     let mut governor = PowerGovernor::new(mode);
     *shared_state.target_gpu_duty_pct.lock().unwrap() = governor.target_duty_cycle() * 100.0;
 
     let mut total_keys_session = 0u128;
     let mut active_runtime_session = Duration::ZERO;
-    let runtime_before_session = checkpoint.total_runtime_secs;
+    let runtime_before_session = checkpoint.total_runtime_secs();
     let mut last_render_instant = Instant::now();
     let mut last_save_instant = Instant::now();
     let mut pause_checkpoint_saved = false;
     let mut terminal_state = false;
+    let mut pending_hit: Option<VerifiedHit> = None;
 
     println!(
         "Starting Bitcoin Puzzle #71 lottery search in [{}] mode...",
@@ -217,6 +234,10 @@ fn main() {
 
     // Step 6: Main Lottery Search Loop
     'search: while !SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+        if checkpoint.is_complete() {
+            println!("Every block in the configured keyspace has completed.");
+            break 'search;
+        }
         if !shared_state.is_running.load(Ordering::SeqCst) {
             *shared_state.current_keys_per_sec.lock().unwrap() = 0.0;
             if !pause_checkpoint_saved {
@@ -253,7 +274,7 @@ fn main() {
         let block_index = ((block_start - RANGE_MIN) / block_size) as u64;
 
         // Skip if already scanned
-        if dup_filter.is_scanned(block_index) {
+        if checkpoint.is_scanned(block_index) {
             continue;
         }
 
@@ -311,20 +332,23 @@ fn main() {
                         "=========================================================================================="
                     );
 
-                    match verify_and_save_candidate(found_key) {
+                    match verify_candidate(found_key) {
                         Ok(hit) => {
                             shared_state.is_running.store(false, Ordering::SeqCst);
                             *shared_state.hit.lock().unwrap() = Some(PublicHitStatus {
-                                bitcoin_address: hit.bitcoin_address.clone(),
-                                saved_filename: hit.saved_filename.clone(),
-                                timestamp_unix: hit.timestamp_unix,
+                                bitcoin_address: hit.bitcoin_address().to_string(),
+                                saved_filename: String::new(),
+                                timestamp_unix: hit.timestamp_unix(),
+                                storage_pending: true,
                             });
 
                             println!("\n  PUZZLE #71 MATCH VERIFIED AND CONFIRMED!");
-                            println!("  Bitcoin Adresse:   {}", hit.bitcoin_address);
-                            println!("  Saved locally to:  {} (mode 0600)", hit.saved_filename);
+                            println!("  Bitcoin Adresse:   {}", hit.bitcoin_address());
+                            println!(
+                                "  Saving the verified hit locally with owner-only permissions..."
+                            );
                             println!("  DO NOT UPLOAD OR SHARE THIS KEY!");
-                            init_claim_service(&shared_state, PathBuf::from(&hit.saved_filename));
+                            pending_hit = Some(hit);
                             terminal_state = true;
                             break 'search;
                         }
@@ -399,14 +423,21 @@ fn main() {
         }
 
         // Commit only a completely processed block to durable coverage.
-        dup_filter.mark_scanned(block_index);
-        checkpoint.scanned_intervals = dup_filter.intervals.intervals.clone();
-        checkpoint.total_blocks_tested = dup_filter.intervals.total_blocks_count();
-        checkpoint.total_keys_tested = checkpoint.total_blocks_tested as u128 * block_size;
-        *shared_state.total_keys_tested.lock().unwrap() = checkpoint.total_keys_tested;
+        if let Err(error) = checkpoint.complete_block(
+            block_index,
+            runtime_before_session + active_runtime_session.as_secs_f64(),
+        ) {
+            set_fatal_error(&shared_state, error);
+            terminal_state = true;
+            break 'search;
+        }
+        *shared_state.total_keys_tested.lock().unwrap() = checkpoint.total_keys_tested();
         shared_state
             .total_blocks_tested
-            .store(checkpoint.total_blocks_tested, Ordering::SeqCst);
+            .store(checkpoint.total_blocks_tested(), Ordering::SeqCst);
+        shared_state
+            .checkpoint_saved_timestamp
+            .store(checkpoint.last_saved_timestamp(), Ordering::SeqCst);
 
         // Render TUI periodically (every 1 second if enabled)
         if enable_tui && last_render_instant.elapsed() >= Duration::from_secs(1) {
@@ -416,8 +447,8 @@ fn main() {
 
             let stats = SolverStats {
                 mode: governor.mode,
-                keys_tested: checkpoint.total_keys_tested,
-                blocks_tested: checkpoint.total_blocks_tested,
+                keys_tested: checkpoint.total_keys_tested(),
+                blocks_tested: checkpoint.total_blocks_tested(),
                 elapsed_duration: Duration::from_secs_f64(
                     runtime_before_session + active_runtime_session.as_secs_f64(),
                 ),
@@ -449,13 +480,24 @@ fn main() {
 
     shared_state.is_running.store(false, Ordering::SeqCst);
     *shared_state.current_keys_per_sec.lock().unwrap() = 0.0;
-    if let Err(error) = persist_checkpoint(
+    let final_checkpoint_saved = match persist_checkpoint(
         &mut checkpoint,
         runtime_before_session,
         active_runtime_session,
         &shared_state,
     ) {
-        set_fatal_error(&shared_state, error);
+        Ok(()) => true,
+        Err(error) => {
+            set_fatal_error(&shared_state, error);
+            false
+        }
+    };
+
+    if let Some(hit) = pending_hit {
+        let saved_path = wait_for_hit_persistence(hit, &shared_state);
+        if !SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+            init_claim_service(&shared_state, saved_path);
+        }
     }
 
     if terminal_state && !SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
@@ -465,39 +507,12 @@ fn main() {
         }
     }
 
-    println!("\nShutdown complete. Final checkpoint is synchronized.");
-}
-
-#[derive(Clone, Copy)]
-struct DispatchProfile {
-    threads: usize,
-    steps: u32,
-}
-
-impl DispatchProfile {
-    fn batch_keys(self) -> u128 {
-        self.threads as u128 * self.steps as u128
-    }
-}
-
-fn dispatch_profile(mode: PowerMode) -> DispatchProfile {
-    match mode {
-        PowerMode::Eco => DispatchProfile {
-            threads: 1024,
-            steps: 128,
-        },
-        PowerMode::Balanced | PowerMode::Auto => DispatchProfile {
-            threads: 2048,
-            steps: 128,
-        },
-        PowerMode::High => DispatchProfile {
-            threads: 4096,
-            steps: 128,
-        },
-        PowerMode::Full => DispatchProfile {
-            threads: 4096,
-            steps: 256,
-        },
+    if final_checkpoint_saved {
+        println!("\nShutdown complete. Final checkpoint is synchronized.");
+    } else {
+        eprintln!(
+            "\nShutdown complete with a checkpoint error; preserve the snapshot and journal for recovery."
+        );
     }
 }
 
@@ -519,6 +534,7 @@ fn resume_from_found_key(web_host: &str, web_port: u16, found_path: PathBuf) {
         bitcoin_address: TARGET_ADDRESS.to_string(),
         saved_filename,
         timestamp_unix,
+        storage_pending: false,
     });
     start_web_server(web_host, web_port, shared_state.clone()).unwrap_or_else(|e| {
         eprintln!(
@@ -535,40 +551,82 @@ fn resume_from_found_key(web_host: &str, web_port: u16, found_path: PathBuf) {
     println!("\nShutdown complete.");
 }
 
+/// A graceful shutdown waits for the only verified candidate to become durable.
+/// Forced process termination or permanently unavailable storage cannot be made lossless.
+fn wait_for_hit_persistence(mut hit: VerifiedHit, shared_state: &SharedSolverState) -> PathBuf {
+    let mut last_reported_error = None;
+    loop {
+        match hit.persist(Path::new(FOUND_KEY_FILENAME)) {
+            Ok(path) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(FOUND_KEY_FILENAME)
+                    .to_string();
+                *shared_state.hit.lock().unwrap() = Some(PublicHitStatus {
+                    bitcoin_address: hit.bitcoin_address().to_string(),
+                    saved_filename: filename.clone(),
+                    timestamp_unix: hit.timestamp_unix(),
+                    storage_pending: false,
+                });
+                *shared_state.last_error.lock().unwrap() = None;
+                println!("Verified hit saved locally to {filename} (mode 0600).");
+                return path;
+            }
+            Err(error) => {
+                if last_reported_error.as_ref() != Some(&error) {
+                    eprintln!("Verified hit retained; secure storage will retry: {error}");
+                    last_reported_error = Some(error.clone());
+                }
+                *shared_state.last_error.lock().unwrap() = Some(error);
+                // Do not discard the only confirmed key on SIGTERM/SIGINT while storage fails.
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+fn resume_from_staged_hit(web_host: &str, web_port: u16, hit: VerifiedHit) {
+    let shared_state = SharedSolverState::new();
+    shared_state.is_running.store(false, Ordering::SeqCst);
+    *shared_state.hit.lock().unwrap() = Some(PublicHitStatus {
+        bitcoin_address: hit.bitcoin_address().to_string(),
+        saved_filename: String::new(),
+        timestamp_unix: hit.timestamp_unix(),
+        storage_pending: true,
+    });
+    start_web_server(web_host, web_port, shared_state.clone()).unwrap_or_else(|error| {
+        eprintln!("Cannot start recovered-hit dashboard: {error}");
+        std::process::exit(1);
+    });
+    let path = wait_for_hit_persistence(hit, &shared_state);
+    if !SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+        init_claim_service(&shared_state, path);
+        while !SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
 fn telegram_config_path() -> PathBuf {
     let home = env::var_os("HOME").unwrap_or_default();
     PathBuf::from(home).join("Library/Application Support/puzzle71/telegram.json")
 }
 
 fn init_claim_service(shared_state: &SharedSolverState, found_key_path: PathBuf) {
-    let service = ClaimService::new(
+    let mut service = ClaimService::new(
         EsploraUtxoSource::new(CurlTransport),
         SlipstreamSubmitter::new(CurlTransport),
-        TelegramNotifier::new(CurlTransport, telegram_config_path()),
         FoundKeyFile::new(found_key_path),
         PathBuf::from("CLAIM_SUBMITTED.json"),
     );
-    let skip_alert = matches!(service.state(), ClaimState::Submitted { .. });
+    service.on_verified_hit();
     {
         let mut slot = shared_state.claim.lock().unwrap();
         *slot = Some(Box::new(service));
         if let Some(svc) = slot.as_ref() {
             *shared_state.claim_snapshot.lock().unwrap() = Some(svc.state());
         }
-    }
-    if !skip_alert {
-        let claim = shared_state.claim.clone();
-        let snapshot = shared_state.claim_snapshot.clone();
-        thread::spawn(move || {
-            let mut slot = match claim.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(svc) = slot.as_mut() {
-                svc.on_verified_hit();
-                *snapshot.lock().unwrap() = Some(svc.state());
-            }
-        });
     }
     let claim = shared_state.claim.clone();
     let snapshot = shared_state.claim_snapshot.clone();
@@ -589,16 +647,15 @@ fn init_claim_service(shared_state: &SharedSolverState, found_key_path: PathBuf)
 }
 
 fn persist_checkpoint(
-    checkpoint: &mut CheckpointState,
+    checkpoint: &mut CheckpointStore,
     runtime_before_session: f64,
     active_runtime_session: Duration,
     shared_state: &SharedSolverState,
 ) -> Result<(), String> {
-    checkpoint.total_runtime_secs = runtime_before_session + active_runtime_session.as_secs_f64();
-    checkpoint.save_to_file(DEFAULT_CHECKPOINT_FILE)?;
+    checkpoint.persist_runtime(runtime_before_session + active_runtime_session.as_secs_f64())?;
     shared_state
         .checkpoint_saved_timestamp
-        .store(checkpoint.last_saved_timestamp, Ordering::SeqCst);
+        .store(checkpoint.last_saved_timestamp(), Ordering::SeqCst);
     Ok(())
 }
 

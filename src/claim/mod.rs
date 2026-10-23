@@ -2,8 +2,8 @@
 //!
 //! The offline core (`builder`, `verify`, `prevout`, `key`, `destination`, `policy`) builds a
 //! single, fully signed, independently re-verified P2PKH-input transaction and never contacts
-//! the network. `net`, `code`, and `service` add dual-source UTXO fetch, a Telegram one-time
-//! code, and Slipstream-only submission. The dashboard web API and claim panel sit on top.
+//! the network. `net` and `service` add dual-source UTXO fetch and explicit Slipstream-only
+//! submission of an exact preview. The optional Telegram utility is independent of payouts.
 
 pub mod builder;
 pub mod code;
@@ -11,6 +11,7 @@ pub mod destination;
 pub mod error;
 pub mod key;
 mod memory;
+pub(crate) use memory::secure_zero;
 pub mod net;
 pub mod policy;
 pub mod prevout;
@@ -32,8 +33,7 @@ pub use net::{
 };
 pub use prevout::{VerifiedPrevout, p2pkh_script_for_hash160, verify_prevout};
 pub use service::{
-    ClaimOps, ClaimService, ClaimState, FoundKeyFile, KeySource, MAX_ALERT_SENDS,
-    MAX_FAILED_CODE_ATTEMPTS, MIN_EXPECTED_ECONOMIC_TOTAL_SAT, ServiceError,
-    find_verified_found_key,
+    ClaimOps, ClaimService, ClaimState, FoundKeyFile, KeySource, MIN_EXPECTED_ECONOMIC_TOTAL_SAT,
+    ServiceError, find_verified_found_key,
 };
 pub use verify::{ClaimSummary, verify_signed_claim};

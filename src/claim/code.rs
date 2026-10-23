@@ -57,8 +57,8 @@ impl ClaimCode {
         }
         let given = trimmed.as_bytes();
         let mut diff = 0u8;
-        for i in 0..6 {
-            diff |= given[i] ^ self.digits[i];
+        for (i, digit) in given.iter().enumerate() {
+            diff |= *digit ^ self.digits[i];
         }
         Ok(diff == 0)
     }

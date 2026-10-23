@@ -5,7 +5,7 @@ Die Suite spricht den bereits laufenden Solver auf Port 8080 an. Sie startet ihn
 Voraussetzung: Solver lokal gestartet
 
 ```
-cd .. && ./puzzle71_solver --host 127.0.0.1 --port 8080 --no-tui
+cd .. && ./target/release/puzzle71_solver --host 127.0.0.1 --port 8080 --no-tui
 ```
 
 Dann:

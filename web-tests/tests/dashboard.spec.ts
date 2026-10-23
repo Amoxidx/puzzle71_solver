@@ -216,7 +216,7 @@ test.describe("Puzzle #71 dashboard", () => {
     }
   });
 
-  test("verified hit never exposes a private key in page or status payload", async ({ page }) => {
+  test("mocked public hit status renders without a private key in the page", async ({ page }) => {
     const privateKeySentinel = "0x400000000000000123";
     await page.route("**/api/status", async (route) => {
       await route.fulfill({

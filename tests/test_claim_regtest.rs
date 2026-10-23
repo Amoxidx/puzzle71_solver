@@ -421,7 +421,7 @@ fn refuses_to_build_and_therefore_never_sends_when_a_prevout_is_tampered() {
     // "manipulated raw bytes" rejection path end-to-end here we re-run `verify_prevout` with a
     // one-byte-tampered copy of the *real* raw transaction and confirm it is rejected before
     // ever reaching the builder or a `sendrawtransaction` call.
-    let outpoint = prevouts[0].outpoint;
+    let outpoint = prevouts[0].outpoint();
     let raw_hex = rpc(
         None,
         "getrawtransaction",

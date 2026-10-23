@@ -19,7 +19,7 @@ use std::sync::atomic::{Ordering, compiler_fence};
 /// comment notes, the compiler remains free to have copied or moved `buf`'s contents to other
 /// memory locations before this function ever runs. See the `zeroize` crate's documentation for
 /// further discussion of that limitation.
-pub(in crate::claim) fn secure_zero(buf: &mut [u8]) {
+pub(crate) fn secure_zero(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
         // SAFETY: `byte` is a valid, correctly aligned, exclusively borrowed `&mut u8` for the
         // duration of this write, obtained from `buf.iter_mut()` on the caller's own live

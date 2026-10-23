@@ -481,23 +481,6 @@ code,
   max-width: 46rem;
 }
 
-.claim-alert-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
-.claim-alert-status {
-  flex: 1 1 200px;
-  font-size: 13px;
-  color: var(--fg);
-}
-
-.claim-alert-status:empty {
-  display: none;
-}
 
 .claim-step {
   display: flex;
@@ -513,8 +496,7 @@ code,
   min-width: 0;
 }
 
-.claim-field label,
-.claim-check {
+.claim-field label {
   font-size: 13px;
   font-weight: 600;
   color: var(--fg);
@@ -538,11 +520,6 @@ code,
   border-color: var(--edge);
 }
 
-#claim-code {
-  letter-spacing: 0.3em;
-  font-variant-numeric: tabular-nums;
-  max-width: 16rem;
-}
 
 .claim-hint {
   font-size: 12px;
@@ -607,21 +584,7 @@ code,
   font-weight: 700;
 }
 
-.claim-check {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-2);
-  font-weight: 500;
-  line-height: 1.4;
-}
 
-.claim-check input {
-  width: 18px;
-  height: 18px;
-  margin-top: 2px;
-  flex-shrink: 0;
-  accent-color: var(--signal);
-}
 
 .claim-result-status {
   font-size: 16px;
@@ -1295,17 +1258,12 @@ input:focus-visible {
     font-size: clamp(32px, 12vw, 48px);
   }
 
-  .claim-alert-row,
   .claim-field input,
   #btn-claim-prepare,
-  #btn-claim-confirm,
-  #btn-claim-resend {
+  #btn-claim-confirm {
     width: 100%;
   }
 
-  #claim-code {
-    max-width: none;
-  }
 
   .hit-alert {
     margin-left: var(--space-4);

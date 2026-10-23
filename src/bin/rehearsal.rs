@@ -1,9 +1,5 @@
-//! Generalprobe binary: hit file → claim service → real Telegram alert → dashboard →
-//! confirm → local bitcoind regtest.
-//!
-//! Never installed. Does not touch the product binary, `puzzle_config`, or frozen claim-core
-//! files. Network use is Telegram (existing `CurlTransport`) and bitcoind JSON-RPC on
-//! `127.0.0.1` only.
+//! Regtest-only wallet rehearsal using the production ClaimService and local Bitcoin Core RPC.
+//! This binary never connects to Telegram or a mainnet submission provider.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -22,10 +18,9 @@ use bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid};
 use serde_json::{Value, json};
 
 use puzzle71_solver::claim::{
-    ClaimError, ClaimFetchError, ClaimKey, ClaimService, ClaimState, CurlTransport, KeySource,
-    NetError, Notifier, SignedClaim, SubmitError, SubmitReceipt, Submitter, TelegramNotifier,
-    TxStatus, UtxoSnapshot, UtxoSource, find_verified_found_key, p2pkh_script_for_hash160,
-    verify_prevout,
+    ClaimError, ClaimFetchError, ClaimKey, ClaimService, KeySource, NetError, SignedClaim,
+    SubmitError, SubmitReceipt, Submitter, TxStatus, UtxoSnapshot, UtxoSource,
+    find_verified_found_key, p2pkh_script_for_hash160, verify_prevout,
 };
 use puzzle71_solver::puzzle_config::{RANGE_MAX, RANGE_MIN};
 use puzzle71_solver::web::server::{PublicHitStatus, SharedSolverState, start_web_server};
@@ -91,7 +86,7 @@ fn print_usage() {
     eprintln!(
         "Usage:
   rehearsal write-hit [--dir <path>]
-  rehearsal serve [--port <p>] [--dir <path>] [--rpc <host:port>] [--i-know-this-is-the-production-port]"
+  rehearsal serve-regtest [--port <p>] [--dir <path>] [--rpc <host:port>] [--i-know-this-is-the-production-port]"
     );
 }
 
@@ -126,7 +121,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             }
             Ok(Command::WriteHit { dir })
         }
-        "serve" => {
+        "serve-regtest" => {
             let mut port = DEFAULT_SERVE_PORT;
             let mut dir = PathBuf::from(".");
             let mut rpc = None;
@@ -332,19 +327,21 @@ fn cmd_serve(port: u16, dir: &Path, rpc: &str, allow_production_port: bool) -> R
     };
 
     let rpc_client = RpcClient::new(rpc.to_string())?;
+    rpc_client
+        .require_regtest()
+        .map_err(|_| "rehearsal requires an accessible regtest Bitcoin Core node".to_string())?;
     let utxo = RegtestUtxoSource::new(rpc_client.clone(), address.clone(), hash160);
     let submitter = RegtestSubmitter::new(rpc_client);
-    let notifier = TelegramNotifier::new(CurlTransport, telegram_config_path());
     let key_source = RehearsalKeyFile {
         path: found_path.clone(),
         hash160,
     };
-    let service = ClaimService::new(
+    let service = ClaimService::new_for_network(
         utxo,
         submitter,
-        notifier,
         key_source,
         dir.join(MARKER_FILENAME),
+        Network::Regtest,
     );
 
     let shared_state = SharedSolverState::new();
@@ -364,6 +361,7 @@ fn cmd_serve(port: u16, dir: &Path, rpc: &str, allow_production_port: bool) -> R
         bitcoin_address: address.to_string(),
         saved_filename,
         timestamp_unix,
+        storage_pending: false,
     });
 
     start_web_server("127.0.0.1", port, shared_state.clone())
@@ -383,16 +381,15 @@ fn cmd_serve(port: u16, dir: &Path, rpc: &str, allow_production_port: bool) -> R
     Ok(())
 }
 
-fn spawn_claim_threads<U, S, N, K>(
+fn spawn_claim_threads<U, S, K>(
     shared_state: &SharedSolverState,
-    service: ClaimService<U, S, N, K>,
+    mut service: ClaimService<U, S, K>,
 ) where
     U: UtxoSource + Send + 'static,
     S: Submitter + Send + 'static,
-    N: Notifier + Send + 'static,
     K: KeySource + Send + 'static,
 {
-    let skip_alert = matches!(service.state(), ClaimState::Submitted { .. });
+    service.on_verified_hit();
     {
         let mut slot = shared_state.claim.lock().unwrap();
         *slot = Some(Box::new(service));
@@ -400,25 +397,11 @@ fn spawn_claim_threads<U, S, N, K>(
             *shared_state.claim_snapshot.lock().unwrap() = Some(svc.state());
         }
     }
-    if !skip_alert {
-        let claim = shared_state.claim.clone();
-        let snapshot = shared_state.claim_snapshot.clone();
-        thread::spawn(move || {
-            let mut slot = match claim.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(svc) = slot.as_mut() {
-                svc.on_verified_hit();
-                *snapshot.lock().unwrap() = Some(svc.state());
-            }
-        });
-    }
     let claim = shared_state.claim.clone();
     let snapshot = shared_state.claim_snapshot.clone();
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(Duration::from_secs(1));
             let mut slot = match claim.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -430,11 +413,6 @@ fn spawn_claim_threads<U, S, N, K>(
             *snapshot.lock().unwrap() = Some(svc.state());
         }
     });
-}
-
-fn telegram_config_path() -> PathBuf {
-    let home = env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/puzzle71/telegram.json")
 }
 
 struct RehearsalKeyFile {
@@ -468,6 +446,15 @@ impl RpcClient {
             return Err("rpc host must be 127.0.0.1".to_string());
         }
         Ok(Self { addr })
+    }
+
+    fn require_regtest(&self) -> Result<(), RpcError> {
+        let chain = self.call(None, "getblockchaininfo", json!([]))?;
+        if chain.get("chain").and_then(Value::as_str) == Some("regtest") {
+            Ok(())
+        } else {
+            Err(RpcError::Decode)
+        }
     }
 
     fn call(&self, wallet: Option<&str>, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -567,7 +554,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 fn classify_rpc_submit_error(code: i64, message: String) -> SubmitError {
     match code {
-        -25 | -26 | -27 => SubmitError::Rejected(message),
+        -27..=-25 => SubmitError::Rejected(message),
         _ => SubmitError::Ambiguous(NetError::BadResponse),
     }
 }
@@ -601,6 +588,7 @@ impl RegtestUtxoSource {
 
 impl UtxoSource for RegtestUtxoSource {
     fn fetch_verified_prevouts(&self) -> Result<UtxoSnapshot, ClaimFetchError> {
+        self.rpc.require_regtest().map_err(rpc_to_fetch_error)?;
         let descriptor = format!("addr({})", self.address);
         let result = self
             .rpc
@@ -673,6 +661,9 @@ impl Submitter for RegtestSubmitter {
     }
 
     fn submit(&self, claim: &SignedClaim) -> Result<SubmitReceipt, SubmitError> {
+        self.rpc
+            .require_regtest()
+            .map_err(|err| SubmitError::Ambiguous(rpc_to_net_error(err)))?;
         let expected_txid = claim.summary().txid.clone();
         let hex = claim.raw_tx_bytes_for_submission().to_lower_hex_string();
         let result = self.rpc.call(None, "sendrawtransaction", json!([hex]));
@@ -720,7 +711,7 @@ impl Submitter for RegtestSubmitter {
                     .ok_or(NetError::BadResponse)?;
                 Ok(TxStatus::Confirmed { block_height })
             }
-            Err(RpcError::Rpc { code, .. }) if code == -5 => Ok(TxStatus::NotFound),
+            Err(RpcError::Rpc { code: -5, .. }) => Ok(TxStatus::NotFound),
             Err(other) => Err(rpc_to_net_error(other)),
         }
     }

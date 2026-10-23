@@ -96,7 +96,7 @@ pub fn verify_signed_claim(
     // trusting any of them, rather than relying on the builder to have already checked this.
     let mut seen_prevout_outpoints: BTreeSet<(Txid, u32)> = BTreeSet::new();
     for prevout in prevouts {
-        if !seen_prevout_outpoints.insert((prevout.outpoint.txid, prevout.outpoint.vout)) {
+        if !seen_prevout_outpoints.insert((prevout.outpoint().txid, prevout.outpoint().vout)) {
             return Err(ClaimError::DuplicateOutpoint);
         }
     }
@@ -119,7 +119,7 @@ pub fn verify_signed_claim(
     // caller constructed `destination` in a way that already equals it, so this check does not
     // rely on `destination` alone having been validated correctly upstream.
     for prevout in prevouts {
-        if output.script_pubkey.as_script() == prevout.txout.script_pubkey.as_script() {
+        if output.script_pubkey.as_script() == prevout.txout().script_pubkey.as_script() {
             return Err(ClaimError::DestinationIsPuzzleAddress);
         }
     }
@@ -135,9 +135,9 @@ pub fn verify_signed_claim(
     let mut excluded_dust_count = 0usize;
     let mut excluded_dust_sat = 0u64;
     for prevout in prevouts {
-        let value = prevout.txout.value.to_sat();
+        let value = prevout.txout().value.to_sat();
         if policy::is_economic(value, fee_rate_sat_vb) {
-            economic_outpoints.insert((prevout.outpoint.txid, prevout.outpoint.vout));
+            economic_outpoints.insert((prevout.outpoint().txid, prevout.outpoint().vout));
         } else {
             excluded_dust_count += 1;
             excluded_dust_sat += value;
@@ -165,7 +165,7 @@ pub fn verify_signed_claim(
 
     let prevout_by_outpoint: HashMap<(Txid, u32), &TxOut> = prevouts
         .iter()
-        .map(|p| ((p.outpoint.txid, p.outpoint.vout), &p.txout))
+        .map(|p| ((p.outpoint().txid, p.outpoint().vout), p.txout()))
         .collect();
 
     let total_input_sat: u64 = tx
@@ -247,7 +247,9 @@ mod tests {
         let prevout = test_support::funded_prevout(hash160, 10_000_000);
         let destination = test_destination();
         let fee_rate = policy::DEFAULT_FEE_RATE_SAT_VB;
-        let claim = build_signed_claim(&key, &[prevout.clone()], &destination, fee_rate).unwrap();
+        let claim =
+            build_signed_claim(&key, std::slice::from_ref(&prevout), &destination, fee_rate)
+                .unwrap();
         let tx: Transaction = consensus::deserialize(claim.raw_tx_bytes_for_submission()).unwrap();
         (tx, vec![prevout], destination, fee_rate)
     }
@@ -356,7 +358,7 @@ mod tests {
             "test setup: only the economic prevout must be spent"
         );
         tx.input.push(TxIn {
-            previous_output: dust_prevout.outpoint,
+            previous_output: dust_prevout.outpoint(),
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::default(),
@@ -383,7 +385,7 @@ mod tests {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: prevout.outpoint,
+                previous_output: prevout.outpoint(),
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
@@ -410,7 +412,7 @@ mod tests {
         let input_count = tx.input.len() as u64;
         let expected_fee =
             policy::max_vsize(input_count, destination.script_pubkey().as_script()) * fee_rate;
-        let total_input: u64 = prevouts.iter().map(|p| p.txout.value.to_sat()).sum();
+        let total_input: u64 = prevouts.iter().map(|p| p.txout().value.to_sat()).sum();
         // Set the output so the implied fee is exactly `expected_fee + 1`, one sat above the
         // single exact value `check_fee` accepts.
         tx.output[0].value = Amount::from_sat(total_input - (expected_fee + 1));
@@ -425,7 +427,7 @@ mod tests {
         let input_count = tx.input.len() as u64;
         let expected_fee =
             policy::max_vsize(input_count, destination.script_pubkey().as_script()) * fee_rate;
-        let total_input: u64 = prevouts.iter().map(|p| p.txout.value.to_sat()).sum();
+        let total_input: u64 = prevouts.iter().map(|p| p.txout().value.to_sat()).sum();
         // Set the output so the implied fee is exactly `expected_fee - 1`, one sat below the
         // single exact value `check_fee` accepts.
         tx.output[0].value = Amount::from_sat(total_input - (expected_fee - 1));

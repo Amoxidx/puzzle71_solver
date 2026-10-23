@@ -1,9 +1,10 @@
 //! Comprehensive Benchmark Suite for CPU vs Metal GPU and Efficiency Optimization.
 
 use crate::crypto::cpu_engine::cpu_incremental_scan;
-use crate::metal_engine::metal_solver::MetalSolver;
+use crate::metal_engine::metal_solver::{DispatchOutcome, MetalSolver};
 use crate::power::controller::{PowerGovernor, PowerMode};
 use crate::puzzle_config::RANGE_MIN;
+use crate::search::profile::{ALL_POWER_MODES, DispatchProfile, dispatch_profile};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,15 +19,17 @@ pub struct BenchRow {
     pub monthly_cost_eur: f64,
 }
 
-pub fn run_comprehensive_benchmark(electricity_price: f64) {
+pub fn run_comprehensive_benchmark(electricity_price: f64) -> Result<(), String> {
     println!(
         "=========================================================================================="
     );
-    println!("  RUNNING COMPREHENSIVE M4 SILICON BENCHMARK (CPU VS METAL GPU)  ");
+    println!("  RUNNING APPLE SILICON BENCHMARK (CPU VS METAL GPU)  ");
     println!(
         "=========================================================================================="
     );
-    println!("  Benchmarking across multiple compute configurations and power profiles...\n");
+    println!(
+        "  Production profiles; power, temperature, efficiency and cost use model estimates.\n"
+    );
 
     let mut results: Vec<BenchRow> = Vec::new();
     let dummy_target = [0xffu8; 20]; // Dummy target to scan full batch
@@ -36,7 +39,11 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) {
     let mut cpu_gov = PowerGovernor::new(PowerMode::Balanced);
     let cpu_start = Instant::now();
     let cpu_keys = 100_000u128;
-    let _ = cpu_incremental_scan(RANGE_MIN, RANGE_MIN + cpu_keys, &dummy_target);
+    if cpu_incremental_scan(RANGE_MIN, RANGE_MIN + cpu_keys - 1, &dummy_target).is_some() {
+        return Err(
+            "CPU benchmark stopped at an unexpected target; incomplete work is not counted".into(),
+        );
+    }
     let cpu_elapsed = cpu_start.elapsed().as_secs_f64();
     let cpu_metrics = cpu_gov.update();
     let cpu_rate = (cpu_keys as f64) / cpu_elapsed.max(0.001);
@@ -54,39 +61,33 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) {
         monthly_cost_eur: cpu_monthly,
     });
 
-    // 2. Metal GPU Benchmarks across Power Modes (ECO, BALANCED, FULL, AUTO)
-    let solver = MetalSolver::new().expect("Failed to initialize Metal GPU Solver");
-
-    let modes = [
-        (PowerMode::Eco, 8192, 128),
-        (PowerMode::Balanced, 16384, 256),
-        (PowerMode::Auto, 32768, 256),
-        (PowerMode::Full, 65536, 512),
-    ];
-
-    for &(mode, threads, steps) in &modes {
+    // Benchmark the exact dispatch sizes used by the main search, including HIGH.
+    let solver = MetalSolver::new()?;
+    for mode in ALL_POWER_MODES {
+        let profile = dispatch_profile(mode);
         println!(
             "-> Benchmarking Metal GPU [{}] (Threads: {}, Steps: {})...",
             mode.name(),
-            threads,
-            steps
+            profile.threads,
+            profile.steps
         );
         let mut gov = PowerGovernor::new(mode);
         let bench_duration = Duration::from_secs(3);
         let start_time = Instant::now();
-        let mut total_keys = 0u128;
-
-        let batch_keys = (threads * steps) as u128;
-        let mut curr_key = RANGE_MIN;
+        let mut progress = BenchmarkProgress::new(RANGE_MIN);
 
         while start_time.elapsed() < bench_duration {
-            let dispatch_started = Instant::now();
-            let _ = solver.dispatch_block(curr_key, threads, steps as u32, &dummy_target);
-            let dispatch_duration = dispatch_started.elapsed();
-            total_keys += batch_keys;
-            curr_key += batch_keys;
+            let gpu_duration = progress.dispatch_next(profile, |start, profile| {
+                solver.dispatch_exact(
+                    start,
+                    profile.threads,
+                    profile.steps,
+                    profile.batch_keys() as usize,
+                    &dummy_target,
+                )
+            })?;
             gov.update();
-            let idle_duration = gov.required_idle_duration(dispatch_duration);
+            let idle_duration = gov.required_idle_duration(gpu_duration);
             if idle_duration > Duration::ZERO {
                 thread::sleep(idle_duration);
             }
@@ -94,13 +95,13 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) {
 
         let elapsed = start_time.elapsed().as_secs_f64();
         let metrics = gov.update();
-        let rate = (total_keys as f64) / elapsed.max(0.001);
+        let rate = (progress.total_keys as f64) / elapsed.max(0.001);
         let watts = metrics.package_power_watts.max(0.1);
         let kpj = rate / (watts as f64);
         let monthly = (watts as f64 * 24.0 * 30.416 / 1000.0) * electricity_price;
 
         results.push(BenchRow {
-            engine_name: format!("Apple Metal GPU ({})", threads),
+            engine_name: format!("Apple Metal GPU ({})", profile.threads),
             mode_name: mode.name().to_string(),
             power_watts: watts,
             keys_per_sec: rate,
@@ -114,13 +115,13 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) {
     println!(
         "\n=========================================================================================="
     );
-    println!("  FINAL BENCHMARK RESULTS TABLE (Mac mini M4 Target System)");
+    println!("  FINAL BENCHMARK RESULTS TABLE (CURRENT HOST)");
     println!(
         "=========================================================================================="
     );
     println!(
         "| {:<24} | {:<9} | {:<7} | {:<12} | {:<12} | {:<6} | {:<10} |",
-        "Engine", "Mode", "Power", "Keys/s", "Keys/Joule", "Temp", "EUR/Month"
+        "Engine", "Mode", "Est. W", "Keys/s", "Est. Keys/J", "Est. C", "Est. EUR/mo"
     );
     println!(
         "|--------------------------|-----------|---------|--------------|--------------|--------|------------|"
@@ -152,14 +153,14 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) {
         "=========================================================================================="
     );
     println!(
-        "  [*] BEST PERFORMANCE: {} [{}] ({:.2} Mkeys/s @ {:.1} W)",
+        "  [*] BEST PERFORMANCE: {} [{}] ({:.2} Mkeys/s @ est. {:.1} W)",
         results[best_perf_idx].engine_name,
         results[best_perf_idx].mode_name,
         results[best_perf_idx].keys_per_sec / 1_000_000.0,
         results[best_perf_idx].power_watts
     );
     println!(
-        "  [*] BEST EFFICIENCY:  {} [{}] ({:.2} Mkeys/Joule @ {:.1} W)",
+        "  [*] BEST ESTIMATED EFFICIENCY: {} [{}] ({:.2} Mkeys/Joule @ est. {:.1} W)",
         results[best_eff_idx].engine_name,
         results[best_eff_idx].mode_name,
         results[best_eff_idx].keys_per_joule / 1_000_000.0,
@@ -168,4 +169,85 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) {
     println!(
         "==========================================================================================\n"
     );
+    Ok(())
+}
+
+struct BenchmarkProgress {
+    total_keys: u128,
+    next_key: u128,
+}
+
+impl BenchmarkProgress {
+    fn new(start: u128) -> Self {
+        Self {
+            total_keys: 0,
+            next_key: start,
+        }
+    }
+
+    fn dispatch_next<F>(
+        &mut self,
+        profile: DispatchProfile,
+        dispatch: F,
+    ) -> Result<Duration, String>
+    where
+        F: FnOnce(u128, DispatchProfile) -> Result<DispatchOutcome, String>,
+    {
+        let outcome = dispatch(self.next_key, profile)?;
+        if outcome.found_key.is_some() {
+            return Err(
+                "GPU benchmark stopped at an unexpected target; incomplete work is not counted"
+                    .into(),
+            );
+        }
+        self.total_keys += profile.batch_keys();
+        self.next_key += profile.batch_keys();
+        Ok(outcome.gpu_duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_dispatch_does_not_count_or_advance_the_search_range() {
+        let mut progress = BenchmarkProgress::new(RANGE_MIN);
+        let profile = dispatch_profile(PowerMode::Balanced);
+        let error = progress
+            .dispatch_next(profile, |start, actual_profile| {
+                assert_eq!(start, RANGE_MIN);
+                assert_eq!(actual_profile, dispatch_profile(PowerMode::Balanced));
+                Err("injected GPU failure".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "injected GPU failure");
+        assert_eq!(progress.total_keys, 0);
+        assert_eq!(progress.next_key, RANGE_MIN);
+        progress
+            .dispatch_next(profile, |start, _| {
+                assert_eq!(start, RANGE_MIN);
+                Ok(DispatchOutcome {
+                    found_key: None,
+                    gpu_duration: Duration::from_millis(1),
+                })
+            })
+            .unwrap();
+        assert_eq!(progress.total_keys, 262_144);
+        assert_eq!(progress.next_key, RANGE_MIN + 262_144);
+    }
+
+    #[test]
+    fn early_target_does_not_count_a_partially_completed_dispatch() {
+        let mut progress = BenchmarkProgress::new(RANGE_MIN);
+        let result = progress.dispatch_next(dispatch_profile(PowerMode::Eco), |_, _| {
+            Ok(DispatchOutcome {
+                found_key: Some(RANGE_MIN),
+                gpu_duration: Duration::ZERO,
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(progress.total_keys, 0);
+        assert_eq!(progress.next_key, RANGE_MIN);
+    }
 }

@@ -1,6 +1,9 @@
 /target
 puzzle71_solver
 puzzle71_checkpoint*.json
+puzzle71_checkpoint*.journal
+puzzle71_checkpoint*.lock
+puzzle71_checkpoint*.tmp
 solver*.log
 FOUND_KEY*.txt
 .FOUND_KEY*.tmp
