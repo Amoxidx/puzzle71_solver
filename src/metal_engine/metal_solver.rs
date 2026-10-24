@@ -120,6 +120,25 @@ impl MetalSolver {
         })
     }
 
+    /// Exercise a non-initial GPU point against an independent libsecp256k1 target.
+    pub fn self_test(&self) -> Result<(), String> {
+        use bitcoin::hashes::Hash;
+        let key = crate::puzzle_config::RANGE_MIN + 0x10_2345;
+        let mut scalar = [0u8; 32];
+        scalar[16..].copy_from_slice(&key.to_be_bytes());
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&scalar)
+            .map_err(|_| "Invalid internal GPU self-test scalar".to_string())?;
+        let public = secret.public_key(&bitcoin::secp256k1::Secp256k1::signing_only());
+        let target = bitcoin::hashes::hash160::Hash::hash(&public.serialize()).to_byte_array();
+        let outcome = self.dispatch_exact(key - 257, 4, 128, 512, &target)?;
+        if outcome.found_key != Some(key) {
+            return Err(
+                "GPU self-test did not recover the independently derived target".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Batch convert N Jacobian points to Affine points using Montgomery Simultaneous Inversion.
     /// Requires only 1 field inversion for all N points!
     pub fn batch_jacobian_to_affine(jacobians: &[JacobianPoint]) -> Vec<AffinePoint> {

@@ -14,19 +14,17 @@ let claimPending = false;
 let claimBusyKind = null;
 let lastClaimPhase = null;
 let lastClaimTxidLogged = null;
-let claimAlertsRemaining = null;
 let preparedDestination = null;
 let lastPreparedTxid = null;
+let preparedRenderValid = false;
+let claimStoragePending = false;
+let claimServerBusy = false;
+let claimRevision = 0;
 let claimAwaitingOutcome = false;
-let claimAwaitingStartTxid = null;
 let claimAwaitingPolls = 0;
-let claimBusySeenTrue = false;
 
 const CLAIM_INFLIGHT_TEXT = "Vorgang läuft noch – Status wird abgefragt";
-const CLAIM_UNKNOWN_TEXT = "Ergebnis unbekannt – bitte Status prüfen und gegebenenfalls erneut versuchen";
-const CLAIM_UNKNOWN_CONFIRM_TEXT = "Ergebnis unbekannt – bitte Status prüfen und den Code neu eingeben";
-const CLAIM_PREPARE_UNCHANGED_TEXT =
-  "Erneute Prüfung ohne Rückmeldung – die angezeigte Zusammenfassung gilt weiter";
+const CLAIM_UNKNOWN_TEXT = "Ergebnis unklar – Status prüfen und die Adresse vor einem weiteren Sendeversuch erneut prüfen";
 const CLAIM_ERROR_TEXT = {
   invalid_address: "Ungültige Bitcoin-Adresse",
   wrong_network: "Adresse gehört nicht zum Bitcoin-Netz",
@@ -37,10 +35,7 @@ const CLAIM_ERROR_TEXT = {
   network_error: "Netzwerkfehler – bitte erneut versuchen",
   not_prepared: "Zuerst die Adresse prüfen",
   destination_mismatch: "Adresse stimmt nicht mit der geprüften Zusammenfassung überein",
-  wrong_code: "Falscher Code",
-  locked: "Gesperrt nach 5 Fehlversuchen – Solver neu starten, um einen neuen Code zu erhalten",
-  no_code: "Kein Bestätigungscode vorhanden",
-  resend_limit_reached: "Kein weiterer Code-Versand möglich",
+  prepared_txid_mismatch: "Vorschau ist veraltet – Adresse erneut prüfen",
   invalid_state: "Dieser Schritt ist im aktuellen Zustand nicht möglich",
   balance_below_expected: "Guthaben liegt unter dem erwarteten Minimum",
   summary_changed: "Zusammenfassung hat sich geändert – Adresse erneut prüfen",
@@ -50,7 +45,6 @@ const CLAIM_ERROR_TEXT = {
   submission_not_found: "Bei MARA nicht gefunden – gleiche Transaktion erneut senden möglich",
   marker_unreadable: "Markierungsdatei `CLAIM_SUBMITTED.json` unlesbar – bitte von Hand prüfen, bevor erneut gesendet wird",
   storage_error: "Speicherfehler bei der Markierungsdatei",
-  code_unavailable: "Code konnte nicht erzeugt werden",
   claim_build_failed: "Transaktion konnte nicht gebaut werden",
   no_claim_available: "Kein Claim verfügbar",
   claim_busy: "Claim-Dienst ist gerade beschäftigt",
@@ -89,11 +83,11 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   byId("btn-claim-prepare").addEventListener("click", prepareClaim);
   byId("btn-claim-confirm").addEventListener("click", confirmClaim);
-  byId("btn-claim-resend").addEventListener("click", resendClaimCode);
   byId("claim-destination").addEventListener("blur", hintDestination);
-  byId("claim-destination").addEventListener("input", syncConfirmEnabled);
-  byId("claim-code").addEventListener("input", syncConfirmEnabled);
-  byId("claim-verified-on-device").addEventListener("change", syncConfirmEnabled);
+  byId("claim-destination").addEventListener("input", () => {
+    preparedRenderValid = false;
+    syncClaimButtons();
+  });
 
   const initialLogs = document.querySelectorAll("#log-container .log-entry").length;
   byId("log-count").textContent = `${initialLogs} ${initialLogs === 1 ? "Eintrag" : "Einträge"}`;
@@ -125,7 +119,6 @@ async function fetchJson(url, options = {}) {
   if (!response.ok) {
     const error = new Error(data.error || `HTTP ${response.status}`);
     error.code = data.error;
-    error.remaining_attempts = data.remaining_attempts;
     error.txid = data.txid;
     throw error;
   }
@@ -133,10 +126,11 @@ async function fetchJson(url, options = {}) {
 }
 
 async function fetchStatus() {
+  const revision = claimRevision;
   try {
     const data = await fetchJson("/api/status");
     consecutivePollFailures = 0;
-    updateUI(data);
+    updateUI(data, revision);
   } catch (error) {
     consecutivePollFailures += 1;
     if (consecutivePollFailures === 3) {
@@ -148,12 +142,14 @@ async function fetchStatus() {
   }
 }
 
-function updateUI(data) {
+function updateUI(data, revision = claimRevision) {
   isRunning = Boolean(data.is_running);
   currentMode = String(data.mode || "auto").toLowerCase();
   const dutyLimit = clampNumber(data.target_gpu_duty_pct, 0, 90);
 
-  if (data.last_error) {
+  if (data.hit && data.hit.storage_pending) {
+    setStatus("hit", "Treffer bestätigt – Speicherung wird wiederholt");
+  } else if (data.last_error) {
     setStatus("error", "FEHLER — NEUSTART NÖTIG");
   } else if (data.hit) {
     setStatus("hit", "TREFFER — SUCHE BEENDET");
@@ -214,7 +210,10 @@ function updateUI(data) {
 
   renderOdds(Math.max(averageSpeed, currentSpeed, 0));
   renderHit(data.hit);
-  renderClaim(data.claim, data.hit, data.claim_busy);
+  claimStoragePending = Boolean(data.hit && data.hit.storage_pending);
+  if ((revision === claimRevision && (!claimPending || claimAwaitingOutcome)) || claimStoragePending) {
+    renderClaim(data.claim, data.hit, data.claim_busy);
+  }
 
   if (data.last_error && data.last_error !== lastError) {
     lastError = data.last_error;
@@ -235,302 +234,176 @@ function measuredDuty(data) {
 
 function renderHit(hit) {
   if (!hit) return;
+  const pending = Boolean(hit.storage_pending);
   byId("hit-alert").classList.remove("hidden");
+  byId("hit-title").textContent = pending
+    ? "Treffer bestätigt – Speicherung wird wiederholt"
+    : "PUZZLE #71 TREFFER VERIFIZIERT";
+  byId("hit-subtitle").textContent = pending
+    ? "Der Treffer bleibt im Speicher. Die lokale Speicherung wird erneut versucht; die Auszahlung wird danach freigegeben."
+    : "Der Treffer wurde auf der CPU verifiziert. Der Private Key ist ausschließlich in der lokalen Datei gespeichert und wird niemals über die Web-API übertragen.";
   byId("hit-address").textContent = hit.bitcoin_address;
-  byId("hit-filename").textContent = hit.saved_filename;
+  byId("hit-filename").textContent = pending ? "Speicherung ausstehend" : hit.saved_filename;
   byId("hit-timestamp").textContent = formatUnixTimestamp(hit.timestamp_unix, "Unbekannt");
-  if (hit.timestamp_unix !== lastHitTimestamp) {
-    lastHitTimestamp = hit.timestamp_unix;
-    addLog(`[TREFFER] Puzzle #71 verifiziert; Private Key nur lokal in ${hit.saved_filename} gespeichert.`, "hit");
+  const identity = `${hit.timestamp_unix}:${pending}`;
+  if (identity !== lastHitTimestamp) {
+    lastHitTimestamp = identity;
+    addLog(pending
+      ? "[TREFFER] Treffer bestätigt – Speicherung wird wiederholt."
+      : `[TREFFER] Puzzle #71 verifiziert; Private Key nur lokal in ${hit.saved_filename} gespeichert.`, "hit");
   }
 }
 
 function claimPhase(claim) {
-  if (claim == null) return null;
-  if (claim === "Idle" || claim === "Locked") return claim;
-  if (typeof claim === "object") {
-    if (Object.hasOwn(claim, "AwaitingOwner")) return "AwaitingOwner";
-    if (Object.hasOwn(claim, "Prepared")) return "Prepared";
-    if (Object.hasOwn(claim, "Submitted")) return "Submitted";
-    if (Object.hasOwn(claim, "Confirmed")) return "Confirmed";
-    if (Object.hasOwn(claim, "Failed")) return "Failed";
+  if (claim === "Idle" || claim === "AwaitingOwner") return claim;
+  if (claim && typeof claim === "object") {
+    return ["Prepared", "Submitted", "Confirmed", "Failed"].find((key) => Object.hasOwn(claim, key)) || null;
   }
   return null;
 }
 
 function claimFields(claim) {
-  if (!claim || typeof claim !== "object") return {};
-  return claim.AwaitingOwner || claim.Prepared || claim.Submitted || claim.Confirmed || claim.Failed || {};
-}
-
-function satToBtc(sat) {
-  return (Number(sat) / 100_000_000).toFixed(8);
-}
-
-function groupInFours(value) {
-  const compact = String(value || "").replace(/\s+/g, "");
-  const parts = [];
-  for (let i = 0; i < compact.length; i += 4) {
-    parts.push(compact.slice(i, i + 4));
-  }
-  return parts.join(" ");
+  const phase = claimPhase(claim);
+  return claim && typeof claim === "object" ? claim[phase] || {} : {};
 }
 
 function setHidden(id, hidden) {
   byId(id).classList.toggle("hidden", hidden);
 }
 
-function claimErrorText(code, remaining) {
-  if (!code) return "Unbekannter Fehler";
-  const base = CLAIM_ERROR_TEXT[code] || `Unbekannter Fehler (${code})`;
-  if (code === "wrong_code" && remaining != null) {
-    return `${base}. Noch ${remaining} Versuche`;
-  }
-  return base;
+function claimErrorText(code) {
+  return CLAIM_ERROR_TEXT[code] || `Unbekannter Fehler (${code || "?"})`;
+}
+
+function normalizeDestination(value) {
+  const trimmed = String(value || "").trim();
+  return /^(bc1|tb1|bcrt1)/i.test(trimmed) ? trimmed.toLowerCase() : trimmed;
+}
+
+function destinationEditedAfterPrepare() {
+  return normalizeDestination(byId("claim-destination").value) !== normalizeDestination(preparedDestination);
+}
+
+function invalidatePreview() {
+  preparedRenderValid = false;
+  preparedDestination = null;
+  lastPreparedTxid = null;
+  setHidden("claim-step-summary", true);
+  setHidden("claim-step-confirm", true);
+}
+
+function satToBtc(sat) {
+  return (Number(sat) / 100_000_000).toFixed(8);
+}
+
+function renderPrepared(summary, authorized = false) {
+  const destination = String(summary.destination || "");
+  const txid = String(summary.txid || "");
+  if (destination !== preparedDestination || txid !== lastPreparedTxid) preparedRenderValid = false;
+  preparedDestination = destination;
+  lastPreparedTxid = txid;
+  // Only a successful response to this tab's explicit prepare action authorizes Send.
+  if (authorized) preparedRenderValid = Boolean(destination && /^[0-9a-f]{64}$/.test(txid));
+  byId("claim-summary-destination").textContent = destination;
+  byId("claim-summary-inputs").textContent = `${summary.input_count} · ${satToBtc(summary.total_input_sat)} BTC`;
+  byId("claim-summary-fee").textContent = `${formatNumber(summary.fee_sat)} sat · ${formatOne(summary.effective_fee_rate_sat_vb)} sat/vB`;
+  byId("claim-summary-payout").textContent = `${satToBtc(summary.output_sat)} BTC`;
+  byId("claim-summary-dust").textContent = `${summary.excluded_dust_count} · ${formatNumber(summary.excluded_dust_sat)} sat`;
+  setHidden("claim-step-summary", false);
+  setHidden("claim-step-confirm", false);
 }
 
 function renderClaim(claim, hit, claimBusy) {
-  const panel = byId("claim-panel");
-  if (!hit || claim == null) {
-    panel.classList.add("hidden");
-    lastClaimPhase = null;
+  claimServerBusy = Boolean(claimBusy);
+  if (!hit || hit.storage_pending || claim == null) {
+    byId("claim-panel").classList.add("hidden");
+    invalidatePreview();
+    syncClaimButtons();
     return;
   }
-  panel.classList.remove("hidden");
+  byId("claim-panel").classList.remove("hidden");
   const phase = claimPhase(claim);
   const fields = claimFields(claim);
-
   if (claimAwaitingOutcome) {
     claimAwaitingPolls += 1;
-    if (claimBusy === true) {
-      claimBusySeenTrue = true;
-    }
-    const currentTxid = phase === "Prepared" && fields.summary
-      ? String(fields.summary.txid || "")
-      : "";
-    const txidChanged = Boolean(claimAwaitingStartTxid)
-      && Boolean(currentTxid)
-      && currentTxid !== claimAwaitingStartTxid;
-    const busyReleased = claimBusy === false
-      && (claimBusySeenTrue || claimAwaitingPolls >= 2);
-    const phaseChanged = phase !== lastClaimPhase;
-    if (phaseChanged || txidChanged || busyReleased) {
-      const wasPrepare = claimBusyKind === "prepare";
-      const wasConfirm = claimBusyKind === "confirm";
-      const inflightTarget = wasPrepare
-        ? "claim-destination-error"
-        : "claim-confirm-error";
+    if (phase === "Submitted" || phase === "Confirmed" || (!claimBusy && claimAwaitingPolls >= 2)) {
       claimAwaitingOutcome = false;
       claimPending = false;
       claimBusyKind = null;
-      claimAwaitingStartTxid = null;
-      for (const id of ["claim-destination-error", "claim-confirm-error"]) {
-        if (byId(id).textContent === CLAIM_INFLIGHT_TEXT) {
-          byId(id).textContent = "";
-        }
-      }
-      const unchangedPreparedPrepare = wasPrepare && phase === "Prepared";
-      if (wasConfirm && phaseChanged && phase === "AwaitingOwner") {
-        byId("claim-destination-error").textContent = CLAIM_ERROR_TEXT.summary_changed;
-      } else if (wasPrepare && phase === "Prepared" && !phaseChanged && !txidChanged) {
-        byId("claim-destination-error").textContent = CLAIM_PREPARE_UNCHANGED_TEXT;
-      } else if (!phaseChanged && !txidChanged && !unchangedPreparedPrepare) {
-        if (wasConfirm) {
-          byId("claim-code").value = "";
-          byId(inflightTarget).textContent = CLAIM_UNKNOWN_CONFIRM_TEXT;
-        } else {
-          byId(inflightTarget).textContent = CLAIM_UNKNOWN_TEXT;
-        }
-      }
+      preparedRenderValid = false;
+      clearClaimActionErrors();
+      if (phase !== "Submitted" && phase !== "Confirmed") byId("claim-confirm-error").textContent = CLAIM_UNKNOWN_TEXT;
     }
   }
-
-  if (phase !== lastClaimPhase) {
-    if (phase === "Submitted" || phase === "Confirmed") {
-      byId("claim-confirm-error").textContent = "";
-      byId("claim-destination-error").textContent = "";
-    }
-    if (phase !== "Prepared") {
-      byId("claim-code").value = "";
-      byId("claim-verified-on-device").checked = false;
-    }
-    lastClaimPhase = phase;
-  }
-
-  const showAlert = phase === "Idle" || phase === "AwaitingOwner" || phase === "Prepared" || phase === "Failed";
-  const alertEl = byId("claim-alert-status");
-  if (showAlert && Object.hasOwn(fields, "alert_sent")) {
-    alertEl.textContent = fields.alert_sent
-      ? "Code per Telegram gesendet"
-      : "Telegram-Versand fehlgeschlagen";
-  } else if (showAlert && phase === "Idle") {
-    alertEl.textContent = "";
-  } else {
-    alertEl.textContent = "";
-  }
-  const resend = byId("btn-claim-resend");
-  resend.classList.toggle("hidden", !showAlert || phase === "Idle");
-  setHidden("claim-alert-row", !showAlert);
-  claimAlertsRemaining = fields.alerts_remaining;
-
-  const showDest = phase === "Idle" || phase === "AwaitingOwner" || phase === "Prepared" || phase === "Failed";
-  setHidden("claim-step-destination", !showDest);
-  setHidden("claim-step-summary", phase !== "Prepared");
-  setHidden("claim-step-confirm", phase !== "Prepared");
-  setHidden("claim-step-result", !["Submitted", "Confirmed", "Locked", "Failed"].includes(phase));
-
-  if (phase === "Prepared" && fields.summary) {
-    const summary = fields.summary;
-    preparedDestination = String(summary.destination || "");
-    lastPreparedTxid = String(summary.txid || "");
-    const destInput = byId("claim-destination");
-    if (!destInput.value.trim() && preparedDestination) {
-      destInput.value = preparedDestination;
-    }
-    byId("claim-summary-destination").textContent = groupInFours(summary.destination);
-    byId("claim-summary-inputs").textContent =
-      `${summary.input_count} · ${satToBtc(summary.total_input_sat)} BTC`;
-    byId("claim-summary-fee").textContent =
-      `${formatNumber(summary.fee_sat)} sat · ${formatOne(summary.effective_fee_rate_sat_vb)} sat/vB`;
-    byId("claim-summary-payout").textContent = `${satToBtc(summary.output_sat)} BTC`;
-    byId("claim-summary-dust").textContent =
-      `${summary.excluded_dust_count} · ${formatNumber(summary.excluded_dust_sat)} sat`;
+  setHidden("claim-step-destination", !["Idle", "AwaitingOwner", "Prepared", "Failed"].includes(phase));
+  setHidden("claim-step-result", !["Submitted", "Confirmed", "Failed"].includes(phase));
+  if (phase === "Prepared" && fields.summary && !(claimPending && claimBusyKind === "prepare" && !claimAwaitingOutcome)) {
+    renderPrepared(fields.summary);
   } else if (phase !== "Prepared") {
-    preparedDestination = null;
-    lastPreparedTxid = null;
+    invalidatePreview();
   }
-
-  if (phase === "Prepared" && typeof fields.attempts_remaining === "number") {
-    byId("claim-attempts").textContent = `Verbleibende Code-Versuche: ${fields.attempts_remaining}`;
-  } else {
-    byId("claim-attempts").textContent = "";
-  }
-
-  const resultStatus = byId("claim-result-status");
-  const resultTxid = byId("claim-result-txid");
-  const resultDetail = byId("claim-result-detail");
-  resultTxid.textContent = "";
-  resultDetail.textContent = "";
+  const status = byId("claim-result-status");
+  byId("claim-result-txid").textContent = fields.txid || "";
+  byId("claim-result-detail").textContent = "";
   if (phase === "Submitted") {
-    resultStatus.textContent = "Eingereicht";
-    resultTxid.textContent = fields.txid || "";
-    resultDetail.textContent =
-      "Warte auf Bestätigung im nächsten MARA-Block (≈5 % Hashrate, im Mittel etwa 3 Stunden)";
+    status.textContent = "Eingereicht";
+    byId("claim-result-detail").textContent = "Die Einreichung ist noch keine Blockbestätigung. Der Status wird weiter geprüft.";
     if (fields.txid && fields.txid !== lastClaimTxidLogged) {
       lastClaimTxidLogged = fields.txid;
       addLog(`[CLAIM] Eingereicht: ${fields.txid}`, "success");
     }
   } else if (phase === "Confirmed") {
-    resultStatus.textContent = `Bestätigt in Block ${fields.block_height}`;
-    resultTxid.textContent = fields.txid || "";
-    resultDetail.textContent = "";
-  } else if (phase === "Locked") {
-    resultStatus.textContent = "Gesperrt nach 5 Fehlversuchen – Solver neu starten, um einen neuen Code zu erhalten";
-    resultTxid.textContent = "";
-    resultDetail.textContent = "";
+    status.textContent = `Bestätigt in Block ${fields.block_height}`;
   } else if (phase === "Failed") {
-    resultStatus.textContent = "Fehlgeschlagen";
-    resultTxid.textContent = "";
-    resultDetail.textContent = CLAIM_FAILED_TEXT[fields.reason]
-      || CLAIM_ERROR_TEXT[fields.reason]
-      || `Unbekannter Fehler (${fields.reason || "?"})`;
+    status.textContent = "Einreichung prüfen";
+    byId("claim-result-detail").textContent = CLAIM_FAILED_TEXT[fields.reason] || claimErrorText(fields.reason);
   } else {
-    resultStatus.textContent = "";
+    status.textContent = "";
   }
-
+  lastClaimPhase = phase;
   syncClaimButtons();
 }
 
-function normalizeDestination(value) {
-  const trimmed = String(value || "").trim();
-  if (trimmed.toLowerCase().startsWith("bc1")) {
-    return trimmed.toLowerCase();
-  }
-  return trimmed;
-}
-
-function destinationsMatch(left, right) {
-  return normalizeDestination(left) === normalizeDestination(right);
-}
-
-function destinationEditedAfterPrepare() {
-  if (lastClaimPhase !== "Prepared" || !preparedDestination) return false;
-  return !destinationsMatch(byId("claim-destination").value, preparedDestination);
-}
-
-function syncDestinationMismatch() {
-  const mismatch = destinationEditedAfterPrepare();
-  byId("claim-destination-mismatch").textContent = mismatch
-    ? "Adresse wurde nach dem Prüfen geändert – bitte erneut prüfen"
-    : "";
-  return mismatch;
-}
-
-function syncConfirmEnabled() {
-  const prepared = lastClaimPhase === "Prepared";
-  const checked = byId("claim-verified-on-device").checked;
-  const six = /^\d{6}$/.test(byId("claim-code").value.trim());
-  const mismatch = syncDestinationMismatch();
-  byId("btn-claim-confirm").disabled = claimPending || !prepared || !checked || !six || mismatch;
-}
-
 function syncClaimButtons() {
-  const prepare = byId("btn-claim-prepare");
-  const confirm = byId("btn-claim-confirm");
-  const resend = byId("btn-claim-resend");
-  prepare.disabled = claimPending;
-  prepare.textContent = claimBusyKind === "prepare" ? "Prüfe …" : "Adresse prüfen";
-  resend.disabled = claimPending || (claimAlertsRemaining != null && claimAlertsRemaining <= 0);
-  resend.textContent = claimBusyKind === "resend" ? "Sende …" : "Neuen Code senden";
-  confirm.textContent = claimBusyKind === "confirm" ? "Sende …" : "Transaktion an MARA Slipstream senden";
-  if (claimPending) {
-    confirm.disabled = true;
-  } else {
-    syncConfirmEnabled();
-  }
+  const blocked = claimPending || claimServerBusy || claimStoragePending;
+  byId("btn-claim-prepare").disabled = blocked;
+  byId("claim-destination").disabled = blocked;
+  byId("btn-claim-confirm").disabled = blocked || !preparedRenderValid || !lastPreparedTxid || destinationEditedAfterPrepare();
+  byId("claim-destination-mismatch").textContent = preparedDestination && destinationEditedAfterPrepare()
+    ? "Adresse geändert – bitte erneut prüfen" : "";
 }
 
 function hintDestination() {
   const value = byId("claim-destination").value.trim();
-  const error = byId("claim-destination-error");
-  if (!value) return;
-  const looksValid = value.length >= 26 && value.length <= 90 && /^[A-Za-z0-9]+$/.test(value);
-  if (!looksValid) {
-    if (!error.textContent || error.textContent.startsWith("Hinweis:")) {
-      error.textContent = "Hinweis: Bitcoin-Adressen sind 26–90 Zeichen lang und enthalten nur Buchstaben und Ziffern.";
-    }
-  } else if (error.textContent.startsWith("Hinweis:")) {
-    error.textContent = "";
+  if (value && (value.length < 26 || value.length > 90 || !/^[A-Za-z0-9]+$/.test(value))) {
+    byId("claim-destination-error").textContent = "Hinweis: Bitte eine vollständige Bitcoin-Empfangsadresse einfügen.";
   }
 }
 
 async function withClaimAction(kind, action, errorTarget) {
-  if (claimPending) return;
+  if (claimPending || claimServerBusy || claimStoragePending) return;
   claimPending = true;
   claimBusyKind = kind;
+  claimRevision += 1;
   syncClaimButtons();
   try {
     await action();
   } catch (error) {
-    if ((kind === "prepare" || kind === "confirm") && error.networkFailure) {
+    preparedRenderValid = false;
+    if (error.networkFailure) {
       claimAwaitingOutcome = true;
       claimAwaitingPolls = 0;
-      claimBusySeenTrue = false;
-      claimAwaitingStartTxid = lastPreparedTxid;
       byId(errorTarget).textContent = CLAIM_INFLIGHT_TEXT;
     } else {
-      const message = claimErrorText(error.code || error.message, error.remaining_attempts);
-      byId(errorTarget).textContent = message;
-      if (kind === "confirm") {
-        byId("claim-code").value = "";
-      }
+      byId(errorTarget).textContent = claimErrorText(error.code || error.message);
     }
   } finally {
+    claimRevision += 1;
     if (!claimAwaitingOutcome) {
       claimPending = false;
       claimBusyKind = null;
-      syncClaimButtons();
     }
+    syncClaimButtons();
     scheduleStatusPoll(0);
   }
 }
@@ -541,51 +414,35 @@ function clearClaimActionErrors() {
 }
 
 function prepareClaim() {
+  if (claimPending || claimServerBusy || claimStoragePending) return;
   clearClaimActionErrors();
   const destination = byId("claim-destination").value.trim();
+  invalidatePreview();
   return withClaimAction("prepare", async () => {
     const result = await fetchJson("/api/claim/prepare", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ destination }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destination }),
     });
-    if (result.summary && result.summary.destination) {
-      byId("claim-destination").value = result.summary.destination;
-      preparedDestination = result.summary.destination;
-    }
-    addLog("[CLAIM] Adresse geprüft", "success");
+    if (!result.summary) throw new Error("claim_build_failed");
+    byId("claim-destination").value = result.summary.destination;
+    renderPrepared(result.summary, true);
+    lastClaimPhase = "Prepared";
+    setHidden("claim-step-result", true);
+    addLog("[CLAIM] Adresse und Auszahlung geprüft", "success");
   }, "claim-destination-error");
 }
 
 function confirmClaim() {
+  if (!preparedRenderValid || !lastPreparedTxid || destinationEditedAfterPrepare() || claimPending || claimServerBusy || claimStoragePending) return;
   clearClaimActionErrors();
-  if (!preparedDestination || destinationEditedAfterPrepare()) return;
   const destination = preparedDestination;
-  const code = byId("claim-code").value.trim();
+  const prepared_txid = lastPreparedTxid;
+  preparedRenderValid = false;
   return withClaimAction("confirm", async () => {
     const result = await fetchJson("/api/claim/confirm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ destination, code }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destination, prepared_txid }),
     });
-    byId("claim-code").value = "";
-    if (result.txid) {
-      addLog(`[CLAIM] Eingereicht: ${result.txid}`, "success");
-      lastClaimTxidLogged = result.txid;
-    }
+    renderClaim({ Submitted: { txid: result.txid } }, { storage_pending: false }, false);
   }, "claim-confirm-error");
-}
-
-function resendClaimCode() {
-  clearClaimActionErrors();
-  return withClaimAction("resend", async () => {
-    await fetchJson("/api/claim/resend-code", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    addLog("[CLAIM] Neuen Code angefordert", "info");
-  }, "claim-destination-error");
 }
 
 function renderOdds(rate) {

@@ -28,6 +28,7 @@ pub struct PublicHitStatus {
     pub bitcoin_address: String,
     pub saved_filename: String,
     pub timestamp_unix: u64,
+    pub storage_pending: bool,
 }
 
 #[derive(Clone)]
@@ -126,8 +127,6 @@ struct ApiError<'a> {
 struct ClaimApiError {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    remaining_attempts: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     txid: Option<String>,
 }
 
@@ -135,21 +134,22 @@ impl ClaimApiError {
     fn code(error: &str) -> Self {
         Self {
             error: error.to_string(),
-            remaining_attempts: None,
             txid: None,
         }
     }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PrepareRequest {
     destination: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfirmRequest {
     destination: String,
-    code: String,
+    prepared_txid: String,
 }
 
 #[derive(Serialize)]
@@ -243,11 +243,8 @@ fn handle_client(stream: &mut TcpStream, state: &SharedSolverState, port: u16) {
         return;
     }
 
-    let is_claim_post = method == "POST"
-        && matches!(
-            path,
-            "/api/claim/prepare" | "/api/claim/confirm" | "/api/claim/resend-code"
-        );
+    let is_claim_post =
+        method == "POST" && matches!(path, "/api/claim/prepare" | "/api/claim/confirm");
     if is_claim_post {
         match claim_request_allowed(&request, port) {
             ClaimRequestDecision::Allowed => {
@@ -445,7 +442,6 @@ fn handle_client(stream: &mut TcpStream, state: &SharedSolverState, port: u16) {
         }
         ("POST", "/api/claim/prepare") => handle_claim_prepare(stream, state, &request),
         ("POST", "/api/claim/confirm") => handle_claim_confirm(stream, state, &request),
-        ("POST", "/api/claim/resend-code") => handle_claim_resend(stream, state),
         _ => send_response(
             stream,
             "404 NOT FOUND",
@@ -614,7 +610,13 @@ fn with_claim_service<T, F>(state: &SharedSolverState, op: F) -> Result<T, Claim
 where
     F: FnOnce(&mut dyn ClaimOps) -> Result<T, ServiceError>,
 {
-    if state.hit.lock().unwrap().is_none() {
+    if state
+        .hit
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|hit| hit.storage_pending)
+    {
         return Err(ClaimHandlerError::NoClaim);
     }
     let mut guard = match state.claim.try_lock() {
@@ -671,22 +673,9 @@ fn handle_claim_confirm(stream: &mut TcpStream, state: &SharedSolverState, reque
         }
     };
     match with_claim_service(state, |service| {
-        service.confirm(&parsed.destination, &parsed.code)
+        service.confirm(&parsed.destination, &parsed.prepared_txid)
     }) {
         Ok(SubmitReceipt { txid }) => send_json(stream, "200 OK", &ConfirmResponse { txid }),
-        Err(err) => send_claim_handler_error(stream, err),
-    }
-}
-
-fn handle_claim_resend(stream: &mut TcpStream, state: &SharedSolverState) {
-    match with_claim_service(state, |service| service.resend_alert()) {
-        Ok(()) => send_json(
-            stream,
-            "200 OK",
-            &ApiMessage {
-                status: "code_sent",
-            },
-        ),
         Err(err) => send_claim_handler_error(stream, err),
     }
 }
@@ -719,11 +708,8 @@ fn send_claim_handler_error(stream: &mut TcpStream, err: ClaimHandlerError) {
 
 fn service_error_http_status(err: &ServiceError) -> &'static str {
     match err {
-        ServiceError::Locked
-        | ServiceError::NoCode
-        | ServiceError::NotPrepared
+        ServiceError::NotPrepared
         | ServiceError::InvalidState
-        | ServiceError::ResendLimitReached
         | ServiceError::AlreadySubmittedDifferent { .. } => "409 CONFLICT",
         ServiceError::Storage => "500 INTERNAL SERVER ERROR",
         ServiceError::Fetch(_) | ServiceError::Net(_) => "503 SERVICE UNAVAILABLE",
@@ -733,29 +719,20 @@ fn service_error_http_status(err: &ServiceError) -> &'static str {
 
 fn map_service_error(err: &ServiceError) -> ClaimApiError {
     match err {
-        ServiceError::Locked => ClaimApiError::code("locked"),
-        ServiceError::NoCode => ClaimApiError::code("no_code"),
         ServiceError::NotPrepared => ClaimApiError::code("not_prepared"),
         ServiceError::DestinationMismatch => ClaimApiError::code("destination_mismatch"),
-        ServiceError::WrongCode { remaining } => ClaimApiError {
-            error: "wrong_code".to_string(),
-            remaining_attempts: Some(*remaining),
-            txid: None,
-        },
+        ServiceError::PreparedTxidMismatch => ClaimApiError::code("prepared_txid_mismatch"),
         ServiceError::AlreadySubmittedDifferent { txid } => ClaimApiError {
             error: "already_submitted_different".to_string(),
-            remaining_attempts: None,
             txid: Some(txid.clone()),
         },
         ServiceError::SummaryChanged => ClaimApiError::code("summary_changed"),
         ServiceError::BalanceBelowExpected => ClaimApiError::code("balance_below_expected"),
         ServiceError::FeeFloorTooHigh => ClaimApiError::code("fee_floor_too_high"),
         ServiceError::InvalidState => ClaimApiError::code("invalid_state"),
-        ServiceError::ResendLimitReached => ClaimApiError::code("resend_limit_reached"),
         ServiceError::SubmissionRejected => ClaimApiError::code("submission_rejected"),
         ServiceError::SubmissionUnknown => ClaimApiError::code("submission_unknown"),
         ServiceError::Storage => ClaimApiError::code("storage_error"),
-        ServiceError::CodeUnavailable => ClaimApiError::code("code_unavailable"),
         ServiceError::Claim(ClaimError::InvalidAddress) => ClaimApiError::code("invalid_address"),
         ServiceError::Claim(ClaimError::WrongNetwork) => ClaimApiError::code("wrong_network"),
         ServiceError::Claim(ClaimError::UnsupportedAddressType) => {
@@ -973,6 +950,7 @@ mod tests {
             bitcoin_address: "address".to_string(),
             saved_filename: "FOUND_KEY.txt".to_string(),
             timestamp_unix: 1,
+            storage_pending: false,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("private"));
@@ -1202,18 +1180,14 @@ mod tests {
 
     fn mapped_code(err: ServiceError) -> (String, Option<u8>, Option<String>) {
         let mapped = map_service_error(&err);
-        (mapped.error, mapped.remaining_attempts, mapped.txid)
+        (mapped.error, None, mapped.txid)
     }
 
     #[test]
     fn maps_every_service_error_variant_to_a_stable_json_code() {
         assert_eq!(
-            mapped_code(ServiceError::Locked),
-            ("locked".into(), None, None)
-        );
-        assert_eq!(
-            mapped_code(ServiceError::NoCode),
-            ("no_code".into(), None, None)
+            mapped_code(ServiceError::PreparedTxidMismatch),
+            ("prepared_txid_mismatch".into(), None, None)
         );
         assert_eq!(
             mapped_code(ServiceError::NotPrepared),
@@ -1222,10 +1196,6 @@ mod tests {
         assert_eq!(
             mapped_code(ServiceError::DestinationMismatch),
             ("destination_mismatch".into(), None, None)
-        );
-        assert_eq!(
-            mapped_code(ServiceError::WrongCode { remaining: 3 }),
-            ("wrong_code".into(), Some(3), None)
         );
         assert_eq!(
             mapped_code(ServiceError::AlreadySubmittedDifferent {
@@ -1254,10 +1224,6 @@ mod tests {
             ("invalid_state".into(), None, None)
         );
         assert_eq!(
-            mapped_code(ServiceError::ResendLimitReached),
-            ("resend_limit_reached".into(), None, None)
-        );
-        assert_eq!(
             mapped_code(ServiceError::SubmissionRejected),
             ("submission_rejected".into(), None, None)
         );
@@ -1268,10 +1234,6 @@ mod tests {
         assert_eq!(
             mapped_code(ServiceError::Storage),
             ("storage_error".into(), None, None)
-        );
-        assert_eq!(
-            mapped_code(ServiceError::CodeUnavailable),
-            ("code_unavailable".into(), None, None)
         );
         assert_eq!(
             mapped_code(ServiceError::Claim(ClaimError::InvalidAddress)),
@@ -1321,7 +1283,6 @@ mod tests {
         state: ClaimState,
         prepare_calls: Arc<AtomicUsize>,
         confirm_calls: Arc<AtomicUsize>,
-        resend_calls: Arc<AtomicUsize>,
     }
 
     impl FakeClaim {
@@ -1330,7 +1291,6 @@ mod tests {
                 state,
                 prepare_calls: Arc::new(AtomicUsize::new(0)),
                 confirm_calls: Arc::new(AtomicUsize::new(0)),
-                resend_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -1340,10 +1300,6 @@ mod tests {
             self.state.clone()
         }
         fn on_verified_hit(&mut self) {}
-        fn resend_alert(&mut self) -> Result<(), ServiceError> {
-            self.resend_calls.fetch_add(1, Ordering::SeqCst);
-            Err(ServiceError::InvalidState)
-        }
         fn prepare(&mut self, _: &str) -> Result<ClaimSummary, ServiceError> {
             self.prepare_calls.fetch_add(1, Ordering::SeqCst);
             Err(ServiceError::InvalidState)
@@ -1436,9 +1392,6 @@ mod tests {
     fn status_json_with_prepared_claim_has_no_secret_field_names() {
         assert_status_json_has_no_secret_field_names(ClaimState::Prepared {
             summary: sample_summary(),
-            alert_sent: true,
-            alerts_remaining: 3,
-            attempts_remaining: 5,
         });
     }
 
@@ -1498,6 +1451,7 @@ mod tests {
             bitcoin_address: "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU".to_string(),
             saved_filename: "FOUND_KEY.txt".to_string(),
             timestamp_unix: 1,
+            storage_pending: false,
         });
     }
 
@@ -1542,11 +1496,7 @@ mod tests {
 
     #[test]
     fn claim_prepare_tcp_gate_blocks_before_service() {
-        let fake = FakeClaim::with_state(ClaimState::AwaitingOwner {
-            alert_sent: true,
-            alerts_remaining: 3,
-            attempts_remaining: 5,
-        });
+        let fake = FakeClaim::with_state(ClaimState::AwaitingOwner);
         let count = fake.prepare_calls.clone();
         let state = SharedSolverState::new();
         seed_hit(&state);
@@ -1563,9 +1513,6 @@ mod tests {
     fn claim_confirm_tcp_gate_blocks_before_service() {
         let fake = FakeClaim::with_state(ClaimState::Prepared {
             summary: sample_summary(),
-            alert_sent: true,
-            alerts_remaining: 3,
-            attempts_remaining: 5,
         });
         let count = fake.confirm_calls.clone();
         let state = SharedSolverState::new();
@@ -1574,23 +1521,85 @@ mod tests {
         assert_claim_route_gated_on(
             state,
             "/api/claim/confirm",
-            r#"{"destination":"bc1qtest","code":"123456"}"#,
+            r#"{"destination":"bc1qtest","prepared_txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
             &count,
         );
     }
 
     #[test]
-    fn claim_resend_tcp_gate_blocks_before_service() {
-        let fake = FakeClaim::with_state(ClaimState::AwaitingOwner {
-            alert_sent: true,
-            alerts_remaining: 3,
-            attempts_remaining: 5,
+    fn confirm_requires_prepared_txid_and_rejects_obsolete_or_unknown_fields_before_service() {
+        let fake = FakeClaim::with_state(ClaimState::Prepared {
+            summary: sample_summary(),
         });
-        let count = fake.resend_calls.clone();
+        let calls = fake.confirm_calls.clone();
         let state = SharedSolverState::new();
         seed_hit(&state);
         *state.claim.lock().unwrap() = Some(Box::new(fake));
-        assert_claim_route_gated_on(state, "/api/claim/resend-code", "{}", &count);
+        for body in [
+            r#"{"destination":"bc1qtest"}"#,
+            r#"{"destination":"bc1qtest","code":"123456"}"#,
+            r#"{"destination":"bc1qtest","prepared_txid":null}"#,
+            r#"{"destination":"bc1qtest","prepared_txid":"aa","code":"123456"}"#,
+        ] {
+            let response = exchange_claim_http(state.clone(), |port| {
+                claim_post_http(
+                    "/api/claim/confirm",
+                    Some(format!("http://127.0.0.1:{port}")),
+                    Some(format!("127.0.0.1:{port}")),
+                    "application/json",
+                    body,
+                )
+            });
+            assert!(response.contains("400 BAD REQUEST"), "{response}");
+            assert!(response.contains("invalid_request"), "{response}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn pending_hit_storage_blocks_prepare_and_confirm_before_service() {
+        let fake = FakeClaim::with_state(ClaimState::Prepared {
+            summary: sample_summary(),
+        });
+        let prepares = fake.prepare_calls.clone();
+        let confirms = fake.confirm_calls.clone();
+        let state = SharedSolverState::new();
+        seed_hit(&state);
+        state.hit.lock().unwrap().as_mut().unwrap().storage_pending = true;
+        *state.claim.lock().unwrap() = Some(Box::new(fake));
+        for (path, body) in [
+            ("/api/claim/prepare", r#"{"destination":"bc1qtest"}"#),
+            (
+                "/api/claim/confirm",
+                r#"{"destination":"bc1qtest","prepared_txid":"aa"}"#,
+            ),
+        ] {
+            let response = exchange_claim_http(state.clone(), |port| {
+                claim_post_http(
+                    path,
+                    Some(format!("http://127.0.0.1:{port}")),
+                    Some(format!("127.0.0.1:{port}")),
+                    "application/json",
+                    body,
+                )
+            });
+            assert!(response.contains("409 CONFLICT"), "{response}");
+            assert!(response.contains("no_claim_available"), "{response}");
+        }
+        assert_eq!(prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(confirms.load(Ordering::SeqCst), 0);
+        state.hit.lock().unwrap().as_mut().unwrap().storage_pending = false;
+        let response = exchange_claim_http(state, |port| {
+            claim_post_http(
+                "/api/claim/confirm",
+                Some(format!("http://127.0.0.1:{port}")),
+                Some(format!("127.0.0.1:{port}")),
+                "application/json",
+                r#"{"destination":"bc1qtest","prepared_txid":"aa"}"#,
+            )
+        });
+        assert!(response.contains("invalid_state"), "{response}");
+        assert_eq!(confirms.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1688,7 +1697,7 @@ mod tests {
             .mode(mode)
             .open(path)
             .unwrap();
-        write!(file, "PRIVATE KEY (HEX):       0x{scalar:018x}\n").unwrap();
+        writeln!(file, "PRIVATE KEY (HEX):       0x{scalar:018x}").unwrap();
     }
 
     static RECOVERY_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);

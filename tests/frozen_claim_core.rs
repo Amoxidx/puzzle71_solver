@@ -424,17 +424,17 @@ fn no_dependency_overrides() {
         }
     }
 
-    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-        if !cargo_home.is_empty() {
-            let home = PathBuf::from(cargo_home);
-            for name in ["config", "config.toml"] {
-                let path = home.join(name);
-                assert!(
-                    !path.exists(),
-                    "CARGO_HOME {} must not exist (cargo source overrides)",
-                    path.display()
-                );
-            }
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        let home = PathBuf::from(cargo_home);
+        for name in ["config", "config.toml"] {
+            let path = home.join(name);
+            assert!(
+                !path.exists(),
+                "CARGO_HOME {} must not exist (cargo source overrides)",
+                path.display()
+            );
         }
     }
 }

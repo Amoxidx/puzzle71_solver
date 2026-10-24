@@ -14,18 +14,13 @@
     <section id="claim-panel" class="claim-panel hidden" aria-labelledby="claim-title">
       <p class="claim-eyebrow">Bitcoin Puzzle #71</p>
       <h2 id="claim-title" class="claim-title">PUZZLE SOLVED</h2>
-      <p class="claim-lede">Private Key lokal verifiziert. Die Auszahlung geht ausschließlich privat an MARA Slipstream – nie in den öffentlichen Mempool.</p>
-
-      <div id="claim-alert-row" class="claim-alert-row">
-        <p id="claim-alert-status" class="claim-alert-status" aria-live="polite"></p>
-        <button type="button" id="btn-claim-resend" class="btn btn-secondary">Neuen Code senden</button>
-      </div>
+      <p class="claim-lede">Treffer lokal verifiziert. Wallet-Adresse eingeben, Auszahlung und Gebühr prüfen und anschließend an MARA Slipstream senden.</p>
 
       <div id="claim-step-destination" class="claim-step">
         <div class="claim-field">
           <label for="claim-destination">Deine BTC-Adresse</label>
           <input id="claim-destination" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" class="mono">
-          <p class="claim-hint">Adresse aus deiner Hardware-Wallet einfügen</p>
+          <p class="claim-hint">Empfangsadresse deiner Bitcoin-Wallet einfügen</p>
         </div>
         <button type="button" id="btn-claim-prepare" class="btn btn-primary">Adresse prüfen</button>
         <p id="claim-destination-error" class="claim-error" role="alert"></p>
@@ -52,18 +47,10 @@
             <dd id="claim-summary-dust" class="mono"></dd>
           </div>
         </dl>
-        <label class="claim-check">
-          <input id="claim-verified-on-device" type="checkbox">
-          <span>Ich habe die Adresse Zeichen für Zeichen auf dem Display meiner Hardware-Wallet verglichen</span>
-        </label>
       </div>
 
       <div id="claim-step-confirm" class="claim-step hidden">
-        <div class="claim-field">
-          <label for="claim-code">Code aus Telegram</label>
-          <input id="claim-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" class="mono">
-          <p id="claim-attempts" class="claim-hint"></p>
-        </div>
+        <p class="claim-hint">Prüfe die vollständige Adresse und den Auszahlungsbetrag vor dem Senden.</p>
         <button type="button" id="btn-claim-confirm" class="btn btn-danger" disabled>Transaktion an MARA Slipstream senden</button>
       </div>
 
@@ -82,7 +69,7 @@
           <div class="logo-mark" aria-hidden="true"><span>#71</span></div>
           <div>
             <h1 class="app-title">Bitcoin Puzzle #71 Solver</h1>
-            <p class="app-subtitle">Apple Silicon M4 Metal Compute &middot; 100% Offline &middot; Zero Telemetry</p>
+            <p class="app-subtitle">Apple Silicon M4 Metal Compute &middot; Lokale Suche &middot; Auszahlung über MARA Slipstream</p>
           </div>
         </div>
         <div class="header-right">
@@ -105,8 +92,8 @@
             </svg>
           </span>
           <div>
-            <h2 class="hit-title">PUZZLE #71 TREFFER VERIFIZIERT</h2>
-            <p class="hit-subtitle">Der Treffer wurde auf der CPU verifiziert. Der Private Key wird ausschließlich in der lokalen Datei gespeichert und niemals über die Web-API übertragen.</p>
+            <h2 id="hit-title" class="hit-title">PUZZLE #71 TREFFER VERIFIZIERT</h2>
+            <p id="hit-subtitle" class="hit-subtitle">Der Treffer wurde auf der CPU verifiziert. Der Private Key wird ausschließlich in der lokalen Datei gespeichert und niemals über die Web-API übertragen.</p>
           </div>
         </div>
         <div class="hit-body">
@@ -270,7 +257,7 @@
           </div>
           <div class="metric-sublist">
             <div class="sub-row">
-              <span>Geprüfte Blöcke (2^24)</span>
+              <span>Geprüfte Blöcke</span>
               <strong id="val-total-blocks" class="mono">0</strong>
             </div>
             <div class="sub-row">

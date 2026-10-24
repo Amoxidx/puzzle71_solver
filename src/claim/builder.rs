@@ -76,21 +76,21 @@ pub fn build_signed_claim(
 
     let mut seen_outpoints = BTreeSet::new();
     for prevout in prevouts {
-        if !seen_outpoints.insert((prevout.outpoint.txid, prevout.outpoint.vout)) {
+        if !seen_outpoints.insert((prevout.outpoint().txid, prevout.outpoint().vout)) {
             return Err(ClaimError::DuplicateOutpoint);
         }
     }
 
     let key_script = p2pkh_script_for_hash160(key.hash160());
     for prevout in prevouts {
-        if prevout.txout.script_pubkey.as_script() != key_script.as_script() {
+        if prevout.txout().script_pubkey.as_script() != key_script.as_script() {
             return Err(ClaimError::ScriptMismatch);
         }
     }
 
     let mut economic: Vec<&VerifiedPrevout> = Vec::new();
     for prevout in prevouts {
-        if policy::is_economic(prevout.txout.value.to_sat(), fee_rate_sat_vb) {
+        if policy::is_economic(prevout.txout().value.to_sat(), fee_rate_sat_vb) {
             economic.push(prevout);
         }
     }
@@ -100,7 +100,12 @@ pub fn build_signed_claim(
 
     // Deterministic input order: ascending by (txid bytes, vout), independent of the caller's
     // supplied order — required for `build_signed_claim` to be reproducible byte-for-byte.
-    economic.sort_by_key(|prevout| (prevout.outpoint.txid.to_byte_array(), prevout.outpoint.vout));
+    economic.sort_by_key(|prevout| {
+        (
+            prevout.outpoint().txid.to_byte_array(),
+            prevout.outpoint().vout,
+        )
+    });
 
     let destination_script = destination.script_pubkey();
     // Independent of `destination.rs`'s own puzzle-address check: refuse here too, so a claim
@@ -109,7 +114,7 @@ pub fn build_signed_claim(
     if destination_script.as_script() == key_script.as_script() {
         return Err(ClaimError::DestinationIsPuzzleAddress);
     }
-    let total_input: u64 = economic.iter().map(|p| p.txout.value.to_sat()).sum();
+    let total_input: u64 = economic.iter().map(|p| p.txout().value.to_sat()).sum();
     let fee = policy::max_vsize(economic.len() as u64, &destination_script) * fee_rate_sat_vb;
     let output_value = total_input
         .checked_sub(fee)
@@ -121,7 +126,7 @@ pub fn build_signed_claim(
     let inputs: Vec<TxIn> = economic
         .iter()
         .map(|prevout| TxIn {
-            previous_output: prevout.outpoint,
+            previous_output: prevout.outpoint(),
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::default(),
@@ -330,7 +335,9 @@ mod tests {
         let destination = test_destination();
         let fee_rate = policy::DEFAULT_FEE_RATE_SAT_VB;
 
-        let first = build_signed_claim(&key, &[prevout.clone()], &destination, fee_rate).unwrap();
+        let first =
+            build_signed_claim(&key, std::slice::from_ref(&prevout), &destination, fee_rate)
+                .unwrap();
         let second = build_signed_claim(&key, &[prevout], &destination, fee_rate).unwrap();
 
         assert_eq!(

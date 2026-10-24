@@ -88,7 +88,7 @@ inline U256 u256_sub(thread const U256& a, thread const U256& b) {
     return r;
 }
 
-inline U256 u256_mul(thread const U256& a, thread const U256& b) {
+inline U256 u256_mul(U256 a, U256 b) {
     uint32_t r[16] = {0};
     for (int i = 0; i < 8; ++i) {
         uint64_t carry = 0;
@@ -140,26 +140,28 @@ inline U256 u256_mul(thread const U256& a, thread const U256& b) {
     sum_limbs[8] = (uint32_t)s8;
     sum_limbs[9] = h_prod[9] + (uint32_t)(s8 >> 32);
 
-    // Reduce any remaining overflow in sum_limbs[8..9]
+    // Reduce the coefficient of 2^256. 2^256 ≡ 0x1000003D1 (mod P),
+    // with 0x1000003D1 = 2^32 + 977. The carry out of that fold is again
+    // a coefficient of 2^256; leaving it on the floor drops whole multiples
+    // of 0x1000003D1 ((p-65537)^2 came back 0x1fc30 instead of 0x100020001).
+    // A product of two canonical field elements overflows by well under 2^36,
+    // so three folds are enough. The fourth iteration is only a bound.
     uint64_t extra = (uint64_t)sum_limbs[8] | ((uint64_t)sum_limbs[9] << 32);
-    if (extra != 0) {
-        uint64_t extra_prod = extra * 977ULL;
-        uint64_t extra_shift = extra; // * 2^32
-
-        c = extra_prod;
+    for (int fold = 0; fold < 4 && extra != 0; ++fold) {
+        uint64_t low_carry = extra * 977ULL;
         for (int i = 0; i < 8; ++i) {
-            uint64_t s = (uint64_t)sum_limbs[i] + (c & 0xFFFFFFFFULL);
+            uint64_t s = (uint64_t)sum_limbs[i] + (low_carry & 0xFFFFFFFFULL);
             sum_limbs[i] = (uint32_t)s;
-            c = (s >> 32) + (c >> 32);
+            low_carry = (low_carry >> 32) + (s >> 32);
         }
 
-        // Add extra_shift at index 1
-        c = extra_shift;
+        uint64_t shift_carry = extra;
         for (int i = 1; i < 8; ++i) {
-            uint64_t s = (uint64_t)sum_limbs[i] + (c & 0xFFFFFFFFULL);
+            uint64_t s = (uint64_t)sum_limbs[i] + (shift_carry & 0xFFFFFFFFULL);
             sum_limbs[i] = (uint32_t)s;
-            c = (s >> 32) + (c >> 32);
+            shift_carry = (shift_carry >> 32) + (s >> 32);
         }
+        extra = low_carry + shift_carry;
     }
 
     U256 out;
@@ -185,28 +187,32 @@ inline U256 u256_sqr(thread const U256& a) {
     return u256_mul(a, a);
 }
 
-constant uint32_t P_MINUS_2[8] = {
-    0xFFFFFC2D, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
-    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
-};
+inline U256 u256_square_n(U256 value, uint count) {
+    for (uint i = 0; i < count; ++i) value = u256_sqr(value);
+    return value;
+}
 
-// Modular inverse via addition chain / exponentiation a^(P-2) mod P
+// Fixed addition chain: xN = a^(2^N - 1). This uses 255 squares and 15
+// multiplications instead of 256 squares and 249 multiplications per candidate.
 inline U256 u256_inv(thread const U256& a) {
-    U256 res;
-    for (int i = 0; i < 8; ++i) res.d[i] = (i == 0) ? 1 : 0;
-    U256 base = a;
+    U256 x2 = u256_sqr(a); x2 = u256_mul(x2, a);
+    U256 x3 = u256_sqr(x2); x3 = u256_mul(x3, a);
+    U256 x6 = u256_square_n(x3, 3); x6 = u256_mul(x6, x3);
+    U256 x9 = u256_square_n(x6, 3); x9 = u256_mul(x9, x3);
+    U256 x11 = u256_square_n(x9, 2); x11 = u256_mul(x11, x2);
+    U256 x22 = u256_square_n(x11, 11); x22 = u256_mul(x22, x11);
+    U256 x44 = u256_square_n(x22, 22); x44 = u256_mul(x44, x22);
+    U256 x88 = u256_square_n(x44, 44); x88 = u256_mul(x88, x44);
+    U256 x176 = u256_square_n(x88, 88); x176 = u256_mul(x176, x88);
+    U256 x220 = u256_square_n(x176, 44); x220 = u256_mul(x220, x44);
+    U256 x223 = u256_square_n(x220, 3); x223 = u256_mul(x223, x3);
 
-    for (int i = 0; i < 8; ++i) {
-        uint32_t limb = P_MINUS_2[i];
-        for (int b = 0; b < 32; ++b) {
-            if (limb & 1) {
-                res = u256_mul(res, base);
-            }
-            base = u256_sqr(base);
-            limb >>= 1;
-        }
-    }
-    return res;
+    U256 result = u256_square_n(x223, 23); result = u256_mul(result, x22);
+    result = u256_square_n(result, 5); result = u256_mul(result, a);
+    result = u256_square_n(result, 3); result = u256_mul(result, x2);
+    result = u256_square_n(result, 2); result = u256_mul(result, a);
+    // Final exponent: 2^256 - 2^32 - 979 = P - 2. Zero remains zero.
+    return result;
 }
 
 // ==============================================================================
@@ -544,68 +550,137 @@ struct FoundResult {
     uint32_t found_step_idx;
 };
 
+// Montgomery batch inversion shares one inverse across up to 16 consecutive points.
+// The private arrays hold 16 Jacobians (100 bytes each) and 16 prefix/inverse values
+// (32 bytes each): 2112 bytes per thread before scalar/hash temporaries. Their
+// allocation is compiler-dependent; these are not threadgroup-shared arrays.
+#define AFFINE_BATCH_SIZE 16
+
+// Field operations supply canonical coordinates. Only finite points with nonzero
+// field Z values enter the product.
+// Infinity and zero Z contribute the multiplicative identity instead of poisoning
+// neighboring inverses with a zero product.
+inline bool finite_jacobian(thread const JacobianPoint& point) {
+    return !point.is_inf && !u256_is_zero(point.z);
+}
+
+// Preserve candidate order while advancing the persistent point to the next batch.
+// A zero Z denotes infinity even when its explicit flag has not been normalized.
+inline void collect_jacobian_points(
+    thread JacobianPoint& current,
+    AffinePoint generator,
+    thread JacobianPoint* points,
+    uint count)
+{
+    for (uint i = 0; i < count; ++i) {
+        if (u256_is_zero(current.z)) current.is_inf = true;
+        points[i] = current;
+        current = jacobian_add_affine(current, generator);
+    }
+}
+
+// Precondition: count <= AFFINE_BATCH_SIZE. The forward pass stores products C_i.
+// In reverse, inverse_running * C_(i-1) yields 1/Z_i; multiplying inverse_running
+// by Z_i then removes that point. Lower prefixes remain untouched until consumed.
+// The same array is reused for inverse Z values; skipped points receive zero as
+// a sentinel and count == 0 leaves the array untouched.
+inline void batch_inverse_z(
+    thread const JacobianPoint* points,
+    thread U256* inverses,
+    uint count)
+{
+    U256 running = {{1, 0, 0, 0, 0, 0, 0, 0}};
+    for (uint i = 0; i < count; ++i) {
+        if (finite_jacobian(points[i])) running = u256_mul(running, points[i].z);
+        inverses[i] = running;
+    }
+    U256 inverse_running = u256_inv(running);
+    for (int i = int(count) - 1; i >= 0; --i) {
+        if (!finite_jacobian(points[i])) {
+            inverses[i] = {{0, 0, 0, 0, 0, 0, 0, 0}};
+            continue;
+        }
+        U256 inverse = inverse_running;
+        if (i > 0) {
+            inverse = u256_mul(inverse_running, inverses[i - 1]);
+            inverse_running = u256_mul(inverse_running, points[i].z);
+        }
+        inverses[i] = inverse;
+    }
+}
+
+// For a finite Jacobian (X:Y:Z), recover x=X/Z^2 and y=Y/Z^3 without another inverse.
+inline AffinePoint affine_from_inverse_z(JacobianPoint point, U256 inverse_z) {
+    U256 inverse_z2 = u256_sqr(inverse_z);
+    U256 inverse_z3 = u256_mul(inverse_z2, inverse_z);
+    AffinePoint affine = {
+        u256_mul(point.x, inverse_z2),
+        u256_mul(point.y, inverse_z3),
+        false
+    };
+    return affine;
+}
+
+inline void affine_hash160(AffinePoint point, thread uint32_t* hash) {
+    uint8_t pubkey[33];
+    pubkey[0] = (point.y.d[0] & 1) ? 0x03 : 0x02;
+    for (int limb = 7; limb >= 0; --limb) {
+        uint32_t word = point.x.d[limb];
+        int offset = 1 + (7 - limb) * 4;
+        pubkey[offset] = (uint8_t)(word >> 24);
+        pubkey[offset + 1] = (uint8_t)(word >> 16);
+        pubkey[offset + 2] = (uint8_t)(word >> 8);
+        pubkey[offset + 3] = (uint8_t)word;
+    }
+    uint32_t sha[8];
+    sha256_33_inline(pubkey, sha);
+    ripemd160_32_inline(sha, hash);
+}
+
 kernel void puzzle71_search_kernel(
     device const AffinePoint* initial_points [[buffer(0)]],
-    constant SearchParams& params           [[buffer(1)]],
-    device FoundResult* out_result          [[buffer(2)]],
-    uint thread_id                          [[thread_position_in_grid]])
+    constant SearchParams& params [[buffer(1)]],
+    device FoundResult* out_result [[buffer(2)]],
+    uint thread_id [[thread_position_in_grid]])
 {
-    AffinePoint base_affine = initial_points[thread_id];
-    JacobianPoint curr = {base_affine.x, base_affine.y, {{1,0,0,0,0,0,0,0}}, base_affine.is_inf};
-
-    AffinePoint gen_g = {
+    // The 64-bit product fits the two 32-bit inputs. Reject fully padded threads
+    // before loading their point, then bound the last thread to exact valid keys.
+    uint64_t thread_base = (uint64_t)thread_id * (uint64_t)params.step_count;
+    if (thread_base >= (uint64_t)params.valid_key_count) return;
+    uint thread_keys = (uint)min((uint64_t)params.step_count,
+        (uint64_t)params.valid_key_count - thread_base);
+    AffinePoint base = initial_points[thread_id];
+    JacobianPoint current = {base.x, base.y, {{1,0,0,0,0,0,0,0}}, base.is_inf};
+    AffinePoint generator = {
         {G_X_LIMBS[0], G_X_LIMBS[1], G_X_LIMBS[2], G_X_LIMBS[3], G_X_LIMBS[4], G_X_LIMBS[5], G_X_LIMBS[6], G_X_LIMBS[7]},
         {G_Y_LIMBS[0], G_Y_LIMBS[1], G_Y_LIMBS[2], G_Y_LIMBS[3], G_Y_LIMBS[4], G_Y_LIMBS[5], G_Y_LIMBS[6], G_Y_LIMBS[7]},
         false
     };
-
-    uint32_t steps = params.step_count;
-
-    for (uint32_t s = 0; s < steps; ++s) {
-        uint64_t key_offset = (uint64_t)thread_id * (uint64_t)steps + (uint64_t)s;
-        if (key_offset >= (uint64_t)params.valid_key_count) {
-            break;
+    for (uint step = 0; step < thread_keys;) {
+        uint count = min((uint)AFFINE_BATCH_SIZE, thread_keys - step);
+        JacobianPoint points[AFFINE_BATCH_SIZE];
+        U256 inverses[AFFINE_BATCH_SIZE];
+        collect_jacobian_points(current, generator, points, count);
+        batch_inverse_z(points, inverses, count);
+        for (uint i = 0; i < count; ++i) {
+            if (u256_is_zero(inverses[i])) continue;
+            AffinePoint affine = affine_from_inverse_z(points[i], inverses[i]);
+            uint32_t hash[5];
+            affine_hash160(affine, hash);
+            if (hash[0] == params.target_hash160[0] &&
+                hash[1] == params.target_hash160[1] &&
+                hash[2] == params.target_hash160[2] &&
+                hash[3] == params.target_hash160[3] &&
+                hash[4] == params.target_hash160[4])
+            {
+                atomic_store_explicit(&out_result->found_flag, 1, memory_order_relaxed);
+                out_result->found_thread_id = thread_id;
+                out_result->found_step_idx = step + i;
+                return;
+            }
         }
-
-        // Convert to affine to get compressed pubkey
-        AffinePoint p_aff = jacobian_to_affine(curr);
-
-        // Serialize 33-byte compressed pubkey
-        uint8_t pubkey[33];
-        pubkey[0] = (p_aff.y.d[0] & 1) ? 0x03 : 0x02;
-
-        // Big-endian bytes of x-coordinate
-        for (int limb = 7; limb >= 0; --limb) {
-            uint32_t val = p_aff.x.d[limb];
-            int byte_base = 1 + (7 - limb) * 4;
-            pubkey[byte_base + 0] = (uint8_t)(val >> 24);
-            pubkey[byte_base + 1] = (uint8_t)(val >> 16);
-            pubkey[byte_base + 2] = (uint8_t)(val >> 8);
-            pubkey[byte_base + 3] = (uint8_t)val;
-        }
-
-        // SHA-256
-        uint32_t sha_out[8];
-        sha256_33_inline(pubkey, sha_out);
-
-        // RIPEMD-160
-        uint32_t h160[5];
-        ripemd160_32_inline(sha_out, h160);
-
-        // Compare against target_hash160
-        if (h160[0] == params.target_hash160[0] &&
-            h160[1] == params.target_hash160[1] &&
-            h160[2] == params.target_hash160[2] &&
-            h160[3] == params.target_hash160[3] &&
-            h160[4] == params.target_hash160[4])
-        {
-            atomic_store_explicit(&out_result->found_flag, 1, memory_order_relaxed);
-            out_result->found_thread_id = thread_id;
-            out_result->found_step_idx = s;
-            return;
-        }
-
-        // Advance to next key: curr = curr + G
-        curr = jacobian_add_affine(curr, gen_g);
+        // Advance by the actual tail count, not the batch capacity. This stays at
+        // or below thread_keys even when step_count is near the uint32 limit.
+        step += count;
     }
 }

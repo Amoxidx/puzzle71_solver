@@ -169,7 +169,7 @@ impl SolverStats {
             "=========================================================================================="
         );
         println!(
-            "  Press CTRL+C to pause cleanly (auto-checkpoints to disk). Offline & Zero-Telemetry."
+            "  Press CTRL+C to pause cleanly (auto-checkpoints to disk). Search is local; claims use network services."
         );
         println!(
             "=========================================================================================="

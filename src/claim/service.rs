@@ -1,4 +1,4 @@
-//! Owner-driven claim flow: alert, prepare, confirm against Slipstream, poll.
+//! Owner-driven claim flow: address, verified preview, explicit submission, and status.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -12,23 +12,17 @@ use bitcoin::Network;
 use serde::{Deserialize, Serialize};
 
 use crate::claim::builder::build_signed_claim;
-use crate::claim::code::{ClaimCode, CodeError};
 use crate::claim::destination::parse_destination;
 use crate::claim::error::ClaimError;
 use crate::claim::key::ClaimKey;
 use crate::claim::net::error::NetError;
 use crate::claim::net::esplora::{ClaimFetchError, UtxoSource};
 use crate::claim::net::slipstream::{SubmitError, SubmitReceipt, Submitter, TxStatus};
-use crate::claim::net::telegram::Notifier;
 use crate::claim::policy::{DEFAULT_FEE_RATE_SAT_VB, MAX_FEE_RATE_SAT_VB};
 use crate::claim::prevout::p2pkh_script_for_hash160;
 use crate::claim::verify::ClaimSummary;
 use crate::puzzle_config::{RANGE_MAX, RANGE_MIN, TARGET_HASH160};
 
-/// Failed confirmation attempts counted across every code in this process lifetime.
-pub const MAX_FAILED_CODE_ATTEMPTS: u8 = 5;
-/// First alert plus at most three resends.
-pub const MAX_ALERT_SENDS: u8 = 4;
 /// Confirmed economic inputs must total at least this many satoshis (7.10 BTC).
 pub const MIN_EXPECTED_ECONOMIC_TOTAL_SAT: u64 = 710_000_000;
 /// Consecutive `NotFound` polls in `Submitted` before the claim is treated as missing
@@ -126,20 +120,13 @@ pub fn find_verified_found_key(
     }
 }
 
-/// Public, non-secret snapshot of the claim flow. Never contains a code, key, or tx hex.
+/// Public claim state; authorization never depends on an out-of-band code.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum ClaimState {
     Idle,
-    AwaitingOwner {
-        alert_sent: bool,
-        alerts_remaining: u8,
-        attempts_remaining: u8,
-    },
+    AwaitingOwner,
     Prepared {
         summary: ClaimSummary,
-        alert_sent: bool,
-        alerts_remaining: u8,
-        attempts_remaining: u8,
     },
     Submitted {
         txid: String,
@@ -152,38 +139,21 @@ pub enum ClaimState {
     Failed {
         reason: String,
     },
-    Locked,
 }
 
-/// Recoverable and terminal failures of [`ClaimService`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceError {
-    Locked,
-    NoCode,
     NotPrepared,
     DestinationMismatch,
-    WrongCode {
-        remaining: u8,
-    },
-    /// A pending marker names a different txid than the prepared claim.
-    ///
-    /// Re-submitting the identical txid is allowed (a crash between `write_marker` and `submit`
-    /// leaves a pending marker for the same transaction). A different txid is not: inspect
-    /// `status(txid)` for the named transaction, then delete the marker file by hand if that
-    /// inspection shows the previous submission is gone, and restart the process: the pending
-    /// txid is also held in memory and keeps blocking until the service is recreated.
-    AlreadySubmittedDifferent {
-        txid: String,
-    },
+    PreparedTxidMismatch,
+    AlreadySubmittedDifferent { txid: String },
     SummaryChanged,
     BalanceBelowExpected,
     FeeFloorTooHigh,
     InvalidState,
-    ResendLimitReached,
     SubmissionRejected,
     SubmissionUnknown,
     Storage,
-    CodeUnavailable,
     Claim(ClaimError),
     Fetch(ClaimFetchError),
     Net(NetError),
@@ -192,60 +162,46 @@ pub enum ServiceError {
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServiceError::Locked => f.write_str("claim is locked"),
-            ServiceError::NoCode => f.write_str("no active claim code"),
-            ServiceError::NotPrepared => f.write_str("claim is not prepared"),
-            ServiceError::DestinationMismatch => f.write_str("destination does not match prepare"),
-            ServiceError::WrongCode { remaining } => {
-                write!(f, "wrong code, {remaining} attempts remaining")
-            }
-            ServiceError::AlreadySubmittedDifferent { txid } => {
-                write!(f, "already submitted as {txid}")
-            }
-            ServiceError::SummaryChanged => f.write_str("claim summary changed"),
-            ServiceError::BalanceBelowExpected => f.write_str("balance below expected minimum"),
-            ServiceError::FeeFloorTooHigh => f.write_str("fee floor exceeds maximum"),
-            ServiceError::InvalidState => f.write_str("invalid state for this operation"),
-            ServiceError::ResendLimitReached => f.write_str("alert resend limit reached"),
-            ServiceError::SubmissionRejected => f.write_str("submission rejected"),
-            ServiceError::SubmissionUnknown => f.write_str("submission outcome unknown"),
-            ServiceError::Storage => f.write_str("marker storage failed"),
-            ServiceError::CodeUnavailable => f.write_str("claim code unavailable"),
-            ServiceError::Claim(err) => write!(f, "{err}"),
-            ServiceError::Fetch(err) => write!(f, "{err}"),
-            ServiceError::Net(err) => write!(f, "{err}"),
+            Self::NotPrepared => f.write_str("claim is not prepared"),
+            Self::DestinationMismatch => f.write_str("destination does not match preview"),
+            Self::PreparedTxidMismatch => f.write_str("transaction does not match preview"),
+            Self::AlreadySubmittedDifferent { txid } => write!(f, "already submitted as {txid}"),
+            Self::SummaryChanged => f.write_str("claim summary changed"),
+            Self::BalanceBelowExpected => f.write_str("balance below expected minimum"),
+            Self::FeeFloorTooHigh => f.write_str("fee floor exceeds maximum"),
+            Self::InvalidState => f.write_str("invalid state for this operation"),
+            Self::SubmissionRejected => f.write_str("submission rejected"),
+            Self::SubmissionUnknown => f.write_str("submission outcome unknown"),
+            Self::Storage => f.write_str("marker storage failed"),
+            Self::Claim(err) => write!(f, "{err}"),
+            Self::Fetch(err) => write!(f, "{err}"),
+            Self::Net(err) => write!(f, "{err}"),
         }
     }
 }
-
 impl std::error::Error for ServiceError {}
-
 impl From<ClaimError> for ServiceError {
     fn from(value: ClaimError) -> Self {
-        ServiceError::Claim(value)
+        Self::Claim(value)
     }
 }
-
 impl From<ClaimFetchError> for ServiceError {
     fn from(value: ClaimFetchError) -> Self {
-        ServiceError::Fetch(value)
+        Self::Fetch(value)
     }
 }
-
 impl From<NetError> for ServiceError {
     fn from(value: NetError) -> Self {
-        ServiceError::Net(value)
+        Self::Net(value)
     }
 }
 
 enum Phase {
     Idle,
     AwaitingOwner {
-        code: Option<ClaimCode>,
         pending: Option<(String, u64)>,
     },
     Prepared {
-        code: Option<ClaimCode>,
         destination: String,
         fee_rate_sat_vb: u64,
         summary: ClaimSummary,
@@ -263,25 +219,21 @@ enum Phase {
     },
     Failed {
         reason: String,
-        code: Option<ClaimCode>,
-        pending: Option<(String, u64)>,
-    },
-    Locked {
         pending: Option<(String, u64)>,
     },
 }
 
-/// Orchestrates alert, prepare, confirm, and poll.
-pub struct ClaimService<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> {
+/// A prepared transaction is an exact preview, not an authorization to send it.
+/// Only `confirm(destination, prepared_txid)` can submit, after a fresh rebuild.
+pub struct ClaimService<U: UtxoSource, S: Submitter, K: KeySource> {
     utxo: U,
     submitter: S,
-    notifier: N,
     key_source: K,
     marker_path: PathBuf,
     phase: Phase,
-    failed_attempts: u8,
-    alerts_sent: u8,
-    last_alert_ok: bool,
+    network: Network,
+    submitted_destination: Option<String>,
+    directory_sync: fn(&Path) -> std::io::Result<()>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -293,50 +245,54 @@ struct MarkerFile {
     outcome: String,
 }
 
-impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, N, K> {
-    pub fn new(utxo: U, submitter: S, notifier: N, key_source: K, marker_path: PathBuf) -> Self {
+impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
+    pub fn new(utxo: U, submitter: S, key_source: K, marker_path: PathBuf) -> Self {
+        Self::new_for_network(utxo, submitter, key_source, marker_path, Network::Bitcoin)
+    }
+
+    /// The caller fixes the network at construction. HTTP requests cannot choose it.
+    /// Production uses `new`; the isolated regtest rehearsal uses `Network::Regtest`.
+    pub fn new_for_network(
+        utxo: U,
+        submitter: S,
+        key_source: K,
+        marker_path: PathBuf,
+        network: Network,
+    ) -> Self {
+        let mut submitted_destination = None;
         let phase = match read_marker(&marker_path) {
-            Ok(Some(marker)) if marker.outcome == "pending" => Phase::Submitted {
-                txid: marker.txid,
-                submitted_at_unix: marker.written_at_unix,
-                not_found_polls: 0,
-            },
+            Ok(Some(marker)) if marker.outcome == "pending" => {
+                submitted_destination = Some(marker.destination);
+                Phase::Submitted {
+                    txid: marker.txid,
+                    submitted_at_unix: marker.written_at_unix,
+                    not_found_polls: 0,
+                }
+            }
             Ok(_) => Phase::Idle,
             Err(_) => Phase::Failed {
                 reason: "marker_unreadable".to_string(),
-                code: None,
                 pending: None,
             },
         };
         Self {
             utxo,
             submitter,
-            notifier,
             key_source,
             marker_path,
             phase,
-            failed_attempts: 0,
-            alerts_sent: 0,
-            last_alert_ok: false,
+            network,
+            submitted_destination,
+            directory_sync: sync_directory,
         }
     }
 
     pub fn state(&self) -> ClaimState {
-        let alert_sent = self.last_alert_ok;
-        let alerts_remaining = MAX_ALERT_SENDS.saturating_sub(self.alerts_sent);
-        let attempts_remaining = MAX_FAILED_CODE_ATTEMPTS.saturating_sub(self.failed_attempts);
         match &self.phase {
             Phase::Idle => ClaimState::Idle,
-            Phase::AwaitingOwner { .. } => ClaimState::AwaitingOwner {
-                alert_sent,
-                alerts_remaining,
-                attempts_remaining,
-            },
+            Phase::AwaitingOwner { .. } => ClaimState::AwaitingOwner,
             Phase::Prepared { summary, .. } => ClaimState::Prepared {
                 summary: summary.clone(),
-                alert_sent,
-                alerts_remaining,
-                attempts_remaining,
             },
             Phase::Submitted {
                 txid,
@@ -355,77 +311,40 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
             Phase::Failed { reason, .. } => ClaimState::Failed {
                 reason: reason.clone(),
             },
-            Phase::Locked { .. } => ClaimState::Locked,
         }
     }
 
     pub fn on_verified_hit(&mut self) {
-        if !matches!(self.phase, Phase::Idle) {
-            return;
+        if matches!(self.phase, Phase::Idle) {
+            self.phase = Phase::AwaitingOwner { pending: None };
         }
-        let Ok(code) = ClaimCode::generate() else {
-            self.last_alert_ok = false;
-            self.phase = Phase::AwaitingOwner {
-                code: None,
-                pending: None,
-            };
-            return;
-        };
-        self.last_alert_ok = self.notifier.send_hit_alert(&code).is_ok();
-        self.alerts_sent = self.alerts_sent.saturating_add(1);
-        self.phase = Phase::AwaitingOwner {
-            code: Some(code),
-            pending: None,
-        };
-    }
-
-    pub fn resend_alert(&mut self) -> Result<(), ServiceError> {
-        match &self.phase {
-            Phase::AwaitingOwner { .. } | Phase::Prepared { .. } | Phase::Failed { .. } => {}
-            _ => return Err(ServiceError::InvalidState),
-        }
-        if self.alerts_sent >= MAX_ALERT_SENDS {
-            return Err(ServiceError::ResendLimitReached);
-        }
-        let code = ClaimCode::generate().map_err(|_| ServiceError::CodeUnavailable)?;
-        let send_result = self.notifier.send_hit_alert(&code);
-        self.alerts_sent = self.alerts_sent.saturating_add(1);
-        self.last_alert_ok = send_result.is_ok();
-        self.install_code(code);
-        send_result.map_err(ServiceError::Net)
     }
 
     pub fn prepare(&mut self, destination: &str) -> Result<ClaimSummary, ServiceError> {
-        match &self.phase {
-            Phase::AwaitingOwner { .. } | Phase::Prepared { .. } | Phase::Failed { .. } => {}
-            _ => return Err(ServiceError::InvalidState),
-        }
         let pending = match &self.phase {
-            Phase::Failed { pending, .. }
+            Phase::AwaitingOwner { pending }
             | Phase::Prepared { pending, .. }
-            | Phase::AwaitingOwner { pending, .. } => pending.clone(),
-            _ => None,
+            | Phase::Failed { pending, .. } => pending.clone(),
+            _ => return Err(ServiceError::InvalidState),
         };
-
-        let puzzle_script = p2pkh_script_for_hash160(TARGET_HASH160);
-        let address = parse_destination(destination, Network::Bitcoin, puzzle_script.as_script())?;
-        let floor = self.submitter.fee_floor_sat_vb()?;
-        let fee_rate = DEFAULT_FEE_RATE_SAT_VB.max(floor);
+        // Invalidate the previous preview before any fallible work, even a failed re-prepare.
+        self.phase = Phase::AwaitingOwner {
+            pending: pending.clone(),
+        };
+        let key = self.key_source.load()?;
+        let puzzle_script = p2pkh_script_for_hash160(key.hash160());
+        let address = parse_destination(destination, self.network, puzzle_script.as_script())?;
+        let fee_rate = DEFAULT_FEE_RATE_SAT_VB.max(self.submitter.fee_floor_sat_vb()?);
         if fee_rate > MAX_FEE_RATE_SAT_VB {
             return Err(ServiceError::FeeFloorTooHigh);
         }
-        let key = self.key_source.load()?;
         let snapshot = self.utxo.fetch_verified_prevouts()?;
         let claim = build_signed_claim(&key, &snapshot.prevouts, &address, fee_rate)?;
         if claim.summary().total_input_sat < MIN_EXPECTED_ECONOMIC_TOTAL_SAT {
             return Err(ServiceError::BalanceBelowExpected);
         }
         let summary = claim.summary().clone();
-        drop(claim);
-
-        let code = self.take_code();
         self.phase = Phase::Prepared {
-            code,
             destination: address.to_string(),
             fee_rate_sat_vb: fee_rate,
             summary: summary.clone(),
@@ -437,21 +356,27 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
     pub fn confirm(
         &mut self,
         destination: &str,
-        code: &str,
+        prepared_txid: &str,
     ) -> Result<SubmitReceipt, ServiceError> {
-        if matches!(self.phase, Phase::Locked { .. }) {
-            return Err(ServiceError::Locked);
+        // Repeated clicks for an already submitted exact transaction return its receipt,
+        // rather than signing or sending it again.
+        if let Phase::Submitted { txid, .. } | Phase::Confirmed { txid, .. } = &self.phase {
+            if txid != prepared_txid {
+                return Err(ServiceError::NotPrepared);
+            }
+            let puzzle_script = p2pkh_script_for_hash160(TARGET_HASH160);
+            let address = parse_destination(destination, self.network, puzzle_script.as_script())?;
+            if self.submitted_destination.as_deref() != Some(address.to_string().as_str()) {
+                return Err(ServiceError::DestinationMismatch);
+            }
+            return Ok(SubmitReceipt { txid: txid.clone() });
         }
-        if self.active_code().is_none() {
-            return Err(ServiceError::NoCode);
-        }
-        let (prepared_dest, prepared_rate, prepared_summary, prepared_pending) = match &self.phase {
+        let (prepared_dest, prepared_rate, prepared_summary, pending) = match &self.phase {
             Phase::Prepared {
                 destination,
                 fee_rate_sat_vb,
                 summary,
                 pending,
-                ..
             } => (
                 destination.clone(),
                 *fee_rate_sat_vb,
@@ -461,87 +386,60 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
             _ => return Err(ServiceError::NotPrepared),
         };
         let puzzle_script = p2pkh_script_for_hash160(TARGET_HASH160);
-        let address = parse_destination(destination, Network::Bitcoin, puzzle_script.as_script())?;
+        let address = parse_destination(destination, self.network, puzzle_script.as_script())?;
         if address.to_string() != prepared_dest {
             return Err(ServiceError::DestinationMismatch);
         }
+        if prepared_txid != prepared_summary.txid {
+            return Err(ServiceError::PreparedTxidMismatch);
+        }
 
-        let matched = match self.active_code().map(|c| c.matches(code)) {
-            Some(Ok(is_match)) => is_match,
-            Some(Err(CodeError::Malformed)) => false,
-            Some(Err(CodeError::Unavailable)) => false,
-            None => return Err(ServiceError::NoCode),
-        };
-        if !matched {
-            self.failed_attempts = self.failed_attempts.saturating_add(1);
-            if self.failed_attempts >= MAX_FAILED_CODE_ATTEMPTS {
-                self.phase = Phase::Locked {
-                    pending: prepared_pending,
-                };
-                return Err(ServiceError::Locked);
-            }
-            return Err(ServiceError::WrongCode {
-                remaining: MAX_FAILED_CODE_ATTEMPTS.saturating_sub(self.failed_attempts),
+        let file_marker = read_marker(&self.marker_path)?;
+        if let Some(marker) = &file_marker
+            && marker.outcome == "pending"
+            && marker.txid != prepared_summary.txid
+        {
+            return Err(ServiceError::AlreadySubmittedDifferent {
+                txid: marker.txid.clone(),
             });
         }
-
-        let file_marker = match read_marker(&self.marker_path) {
-            Ok(marker) => marker,
-            Err(_) => return Err(ServiceError::Storage),
-        };
-        if let Some(marker) = &file_marker {
-            if marker.outcome == "pending" && marker.txid != prepared_summary.txid {
-                return Err(ServiceError::AlreadySubmittedDifferent {
-                    txid: marker.txid.clone(),
-                });
-            }
+        if let Some((txid, _)) = &pending
+            && txid != &prepared_summary.txid
+        {
+            return Err(ServiceError::AlreadySubmittedDifferent { txid: txid.clone() });
         }
-        if let Some((txid, _)) = &prepared_pending {
-            if txid != &prepared_summary.txid {
-                return Err(ServiceError::AlreadySubmittedDifferent { txid: txid.clone() });
-            }
-        }
-        let resubmitting_pending = file_marker.as_ref().is_some_and(|marker| {
-            marker.outcome == "pending" && marker.txid == prepared_summary.txid
-        }) || prepared_pending
+        let resubmitting = file_marker
             .as_ref()
-            .is_some_and(|(txid, _)| txid == &prepared_summary.txid);
-
-        let floor = self.submitter.fee_floor_sat_vb()?;
-        if floor > prepared_rate {
-            let code = self.take_code();
-            self.phase = Phase::AwaitingOwner {
-                code,
-                pending: prepared_pending,
-            };
+            .is_some_and(|m| m.outcome == "pending" && m.txid == prepared_summary.txid)
+            || pending
+                .as_ref()
+                .is_some_and(|(id, _)| id == &prepared_summary.txid);
+        if self.submitter.fee_floor_sat_vb()? > prepared_rate {
+            self.phase = Phase::AwaitingOwner { pending };
             return Err(ServiceError::SummaryChanged);
         }
         let key = self.key_source.load()?;
         let snapshot = self.utxo.fetch_verified_prevouts()?;
         let claim = build_signed_claim(&key, &snapshot.prevouts, &address, prepared_rate)?;
         if claim.summary().total_input_sat < MIN_EXPECTED_ECONOMIC_TOTAL_SAT {
+            self.phase = Phase::AwaitingOwner { pending };
             return Err(ServiceError::BalanceBelowExpected);
         }
         if claim.summary().txid != prepared_summary.txid {
-            let code = self.take_code();
-            self.phase = Phase::AwaitingOwner {
-                code,
-                pending: prepared_pending,
-            };
+            self.phase = Phase::AwaitingOwner { pending };
             return Err(ServiceError::SummaryChanged);
         }
-
         let written_at = unix_secs();
         let marker = MarkerFile {
             txid: prepared_summary.txid.clone(),
-            destination: prepared_dest,
+            destination: prepared_dest.clone(),
             fee_rate_sat_vb: prepared_rate,
             written_at_unix: written_at,
             outcome: "pending".to_string(),
         };
-        write_marker(&self.marker_path, &marker)?;
-        self.consume_code();
-
+        // Both file and containing directory must be durable before the first outbound byte.
+        write_marker_with_sync(&self.marker_path, &marker, self.directory_sync)?;
+        self.submitted_destination = Some(prepared_dest);
         match self.submitter.submit(&claim) {
             Ok(receipt) => {
                 self.phase = Phase::Submitted {
@@ -551,15 +449,7 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                 };
                 Ok(receipt)
             }
-            Err(SubmitError::Rejected(_)) => {
-                if resubmitting_pending {
-                    self.phase = Phase::Failed {
-                        reason: "submission_unknown".to_string(),
-                        code: None,
-                        pending: Some((prepared_summary.txid, written_at)),
-                    };
-                    return Err(ServiceError::SubmissionUnknown);
-                }
+            Err(SubmitError::Rejected(_)) if !resubmitting => {
                 match self.submitter.status(&prepared_summary.txid) {
                     Ok(TxStatus::Pending) => {
                         self.phase = Phase::Submitted {
@@ -584,10 +474,18 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                     Ok(TxStatus::NotFound) => {
                         let mut rejected = marker;
                         rejected.outcome = "rejected".to_string();
-                        let _ = write_marker(&self.marker_path, &rejected);
+                        // Failure to persist rejection leaves the safer pending guard in place.
+                        if write_marker_with_sync(&self.marker_path, &rejected, self.directory_sync)
+                            .is_err()
+                        {
+                            self.phase = Phase::Failed {
+                                reason: "submission_unknown".to_string(),
+                                pending: Some((prepared_summary.txid, written_at)),
+                            };
+                            return Err(ServiceError::SubmissionUnknown);
+                        }
                         self.phase = Phase::Failed {
                             reason: "submission_rejected".to_string(),
-                            code: None,
                             pending: None,
                         };
                         Err(ServiceError::SubmissionRejected)
@@ -595,17 +493,15 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                     Err(_) => {
                         self.phase = Phase::Failed {
                             reason: "submission_unknown".to_string(),
-                            code: None,
                             pending: Some((prepared_summary.txid, written_at)),
                         };
                         Err(ServiceError::SubmissionUnknown)
                     }
                 }
             }
-            Err(SubmitError::Ambiguous(_)) => {
+            Err(SubmitError::Rejected(_) | SubmitError::Ambiguous(_)) => {
                 self.phase = Phase::Failed {
                     reason: "submission_unknown".to_string(),
-                    code: None,
                     pending: Some((prepared_summary.txid, written_at)),
                 };
                 Err(ServiceError::SubmissionUnknown)
@@ -614,51 +510,35 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
     }
 
     pub fn poll(&mut self) {
-        let snapshot = match &self.phase {
+        let (txid, submitted_at, misses, from_submitted, from_confirmed) = match &self.phase {
             Phase::Submitted {
                 txid,
                 submitted_at_unix,
                 not_found_polls,
-            } => Some((
+            } => (
                 txid.clone(),
                 *submitted_at_unix,
                 *not_found_polls,
                 true,
                 false,
-                false,
-            )),
+            ),
             Phase::AwaitingOwner {
-                pending: Some((txid, submitted_at)),
+                pending: Some((id, at)),
+            }
+            | Phase::Prepared {
+                pending: Some((id, at)),
                 ..
             }
             | Phase::Failed {
-                pending: Some((txid, submitted_at)),
+                pending: Some((id, at)),
                 ..
-            }
-            | Phase::Prepared {
-                pending: Some((txid, submitted_at)),
-                ..
-            } => Some((txid.clone(), *submitted_at, 0, false, false, false)),
-            Phase::Locked {
-                pending: Some((txid, submitted_at)),
-            } => Some((txid.clone(), *submitted_at, 0, false, true, false)),
+            } => (id.clone(), *at, 0, false, false),
             Phase::Confirmed {
                 txid,
                 submitted_at_unix,
                 ..
-            } => Some((txid.clone(), *submitted_at_unix, 0, false, false, true)),
-            _ => None,
-        };
-        let Some((
-            txid,
-            submitted_at,
-            not_found_polls,
-            from_submitted,
-            from_locked,
-            from_confirmed,
-        )) = snapshot
-        else {
-            return;
+            } => (txid.clone(), *submitted_at_unix, 0, false, true),
+            _ => return,
         };
         match self.submitter.status(&txid) {
             Ok(TxStatus::Confirmed { block_height }) => {
@@ -666,120 +546,67 @@ impl<U: UtxoSource, S: Submitter, N: Notifier, K: KeySource> ClaimService<U, S, 
                     txid,
                     block_height,
                     submitted_at_unix: submitted_at,
-                };
+                }
             }
             Ok(TxStatus::Pending) => {
-                if let Phase::Submitted {
-                    not_found_polls, ..
-                } = &mut self.phase
-                {
-                    *not_found_polls = 0;
-                } else if !from_locked {
-                    self.phase = Phase::Submitted {
-                        txid,
-                        submitted_at_unix: submitted_at,
-                        not_found_polls: 0,
-                    };
+                self.phase = Phase::Submitted {
+                    txid,
+                    submitted_at_unix: submitted_at,
+                    not_found_polls: 0,
                 }
             }
-            Ok(TxStatus::NotFound) => {
-                if from_confirmed {
-                    self.phase = Phase::Submitted {
-                        txid,
-                        submitted_at_unix: submitted_at,
-                        not_found_polls: 1,
-                    };
-                } else if from_submitted {
-                    let next = not_found_polls.saturating_add(1);
-                    if next >= MAX_NOT_FOUND_POLLS {
-                        self.phase = Phase::Failed {
-                            reason: "submission_not_found".to_string(),
-                            code: None,
-                            pending: Some((txid, submitted_at)),
-                        };
-                    } else if let Phase::Submitted {
-                        not_found_polls, ..
-                    } = &mut self.phase
-                    {
-                        *not_found_polls = next;
+            Ok(TxStatus::NotFound) if from_confirmed || from_submitted => {
+                let next = misses.saturating_add(1);
+                self.phase = if next >= MAX_NOT_FOUND_POLLS {
+                    Phase::Failed {
+                        reason: "submission_not_found".to_string(),
+                        pending: Some((txid, submitted_at)),
                     }
-                }
+                } else {
+                    Phase::Submitted {
+                        txid,
+                        submitted_at_unix: submitted_at,
+                        not_found_polls: next,
+                    }
+                };
             }
-            Err(_) => {}
-        }
-    }
-
-    fn active_code(&self) -> Option<&ClaimCode> {
-        match &self.phase {
-            Phase::AwaitingOwner { code, .. } => code.as_ref(),
-            Phase::Prepared { code, .. } => code.as_ref(),
-            Phase::Failed { code, .. } => code.as_ref(),
-            _ => None,
-        }
-    }
-
-    fn take_code(&mut self) -> Option<ClaimCode> {
-        match &mut self.phase {
-            Phase::AwaitingOwner { code, .. } => code.take(),
-            Phase::Prepared { code, .. } => code.take(),
-            Phase::Failed { code, .. } => code.take(),
-            _ => None,
-        }
-    }
-
-    fn consume_code(&mut self) {
-        let _ = self.take_code();
-    }
-
-    fn install_code(&mut self, new_code: ClaimCode) {
-        match &mut self.phase {
-            Phase::AwaitingOwner { code, .. } => *code = Some(new_code),
-            Phase::Prepared { code, .. } => *code = Some(new_code),
-            Phase::Failed { code, .. } => *code = Some(new_code),
-            _ => {}
+            Ok(TxStatus::NotFound) | Err(_) => {}
         }
     }
 }
 
-/// Object-safe claim operations for the dashboard process.
 pub trait ClaimOps: Send {
     fn state(&self) -> ClaimState;
     fn on_verified_hit(&mut self);
-    fn resend_alert(&mut self) -> Result<(), ServiceError>;
     fn prepare(&mut self, destination: &str) -> Result<ClaimSummary, ServiceError>;
-    fn confirm(&mut self, destination: &str, code: &str) -> Result<SubmitReceipt, ServiceError>;
+    fn confirm(
+        &mut self,
+        destination: &str,
+        prepared_txid: &str,
+    ) -> Result<SubmitReceipt, ServiceError>;
     fn poll(&mut self);
 }
-
-impl<U, S, N, K> ClaimOps for ClaimService<U, S, N, K>
-where
-    U: UtxoSource + Send,
-    S: Submitter + Send,
-    N: Notifier + Send,
-    K: KeySource + Send,
+impl<U: UtxoSource + Send, S: Submitter + Send, K: KeySource + Send> ClaimOps
+    for ClaimService<U, S, K>
 {
     fn state(&self) -> ClaimState {
-        ClaimService::state(self)
+        self.state()
     }
-
     fn on_verified_hit(&mut self) {
-        ClaimService::on_verified_hit(self);
+        self.on_verified_hit();
     }
-
-    fn resend_alert(&mut self) -> Result<(), ServiceError> {
-        ClaimService::resend_alert(self)
-    }
-
     fn prepare(&mut self, destination: &str) -> Result<ClaimSummary, ServiceError> {
-        ClaimService::prepare(self, destination)
+        self.prepare(destination)
     }
-
-    fn confirm(&mut self, destination: &str, code: &str) -> Result<SubmitReceipt, ServiceError> {
-        ClaimService::confirm(self, destination, code)
+    fn confirm(
+        &mut self,
+        destination: &str,
+        prepared_txid: &str,
+    ) -> Result<SubmitReceipt, ServiceError> {
+        self.confirm(destination, prepared_txid)
     }
-
     fn poll(&mut self) {
-        ClaimService::poll(self);
+        self.poll();
     }
 }
 
@@ -812,7 +639,20 @@ fn read_marker(path: &Path) -> Result<Option<MarkerFile>, ServiceError> {
     }
 }
 
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
 fn write_marker(path: &Path, marker: &MarkerFile) -> Result<(), ServiceError> {
+    write_marker_with_sync(path, marker, sync_directory)
+}
+
+fn write_marker_with_sync(
+    path: &Path,
+    marker: &MarkerFile,
+    directory_sync: fn(&Path) -> std::io::Result<()>,
+) -> Result<(), ServiceError> {
     let json = serde_json::to_string(marker).map_err(|_| ServiceError::Storage)?;
     let parent = path
         .parent()
@@ -868,7 +708,7 @@ fn write_marker(path: &Path, marker: &MarkerFile) -> Result<(), ServiceError> {
         let _ = fs::remove_file(&temp_path);
         return Err(ServiceError::Storage);
     }
-    let _ = File::open(parent).and_then(|directory| directory.sync_all());
+    directory_sync(parent).map_err(|_| ServiceError::Storage)?;
     Ok(())
 }
 
@@ -878,20 +718,14 @@ mod tests {
         ClaimService, ClaimState, KeySource, MAX_NOT_FOUND_POLLS, MarkerFile, Phase, ServiceError,
         find_verified_found_key, read_marker, write_marker,
     };
-    use crate::claim::code::ClaimCode;
     use crate::claim::error::ClaimError;
     use crate::claim::key::ClaimKey;
     use crate::claim::net::error::NetError;
     use crate::claim::net::esplora::{ClaimFetchError, UtxoSnapshot, UtxoSource};
     use crate::claim::net::slipstream::{SubmitError, SubmitReceipt, Submitter, TxStatus};
-    use crate::claim::net::telegram::Notifier;
     use crate::claim::policy::{self, DEFAULT_FEE_RATE_SAT_VB};
     use crate::claim::prevout::{VerifiedPrevout, p2pkh_script_for_hash160};
     use crate::claim::test_support::{self, TEST_SCALAR};
-    use crate::claim::{build_signed_claim, parse_destination};
-    use crate::puzzle_config::TARGET_HASH160;
-    use bitcoin::Network;
-    use bitcoin::hex::DisplayHex;
     use std::cell::{Cell, RefCell};
     use std::fs;
     use std::ops::{Deref, DerefMut};
@@ -970,24 +804,6 @@ mod tests {
         }
     }
 
-    struct FakeNotifier {
-        sends: Cell<u32>,
-        fail: Cell<bool>,
-        last: RefCell<Option<String>>,
-    }
-
-    impl Notifier for FakeNotifier {
-        fn send_hit_alert(&self, code: &ClaimCode) -> Result<(), NetError> {
-            self.sends.set(self.sends.get() + 1);
-            *self.last.borrow_mut() = Some(code.digits_for_alert());
-            if self.fail.get() {
-                Err(NetError::HttpStatus(500))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
     fn economic_prevouts() -> Vec<VerifiedPrevout> {
         let hash160 = test_support::derive_hash160(TEST_SCALAR);
         vec![test_support::funded_prevout(hash160, 710_000_000)]
@@ -1009,12 +825,12 @@ mod tests {
     }
 
     struct Harness {
-        service: ClaimService<FakeUtxos, FakeSubmitter, FakeNotifier, FakeKey>,
+        service: ClaimService<FakeUtxos, FakeSubmitter, FakeKey>,
         _tmp: TempDir,
     }
 
     impl Deref for Harness {
-        type Target = ClaimService<FakeUtxos, FakeSubmitter, FakeNotifier, FakeKey>;
+        type Target = ClaimService<FakeUtxos, FakeSubmitter, FakeKey>;
         fn deref(&self) -> &Self::Target {
             &self.service
         }
@@ -1042,9 +858,7 @@ mod tests {
         }
     }
 
-    fn service_at(
-        marker: PathBuf,
-    ) -> ClaimService<FakeUtxos, FakeSubmitter, FakeNotifier, FakeKey> {
+    fn service_at(marker: PathBuf) -> ClaimService<FakeUtxos, FakeSubmitter, FakeKey> {
         ClaimService::new(
             FakeUtxos {
                 prevouts: RefCell::new(economic_prevouts()),
@@ -1056,11 +870,6 @@ mod tests {
                 mode: Cell::new(SubmitMode::Success),
                 status: Cell::new(TxStatus::Confirmed { block_height: 1 }),
                 status_err: Cell::new(false),
-            },
-            FakeNotifier {
-                sends: Cell::new(0),
-                fail: Cell::new(false),
-                last: RefCell::new(None),
             },
             FakeKey,
             marker,
@@ -1076,22 +885,11 @@ mod tests {
         }
     }
 
-    fn last_code(
-        service: &ClaimService<FakeUtxos, FakeSubmitter, FakeNotifier, FakeKey>,
-    ) -> String {
-        service
-            .notifier
-            .last
-            .borrow()
-            .clone()
-            .expect("alert sent a code")
-    }
-
-    fn wrong_code(real: &str) -> String {
-        let mut digits = real.as_bytes().to_vec();
-        let d = digits[5] - b'0';
-        digits[5] = b'0' + (d + 1) % 10;
-        String::from_utf8(digits).expect("digits")
+    fn prepared_txid(service: &ClaimService<FakeUtxos, FakeSubmitter, FakeKey>) -> String {
+        match &service.phase {
+            Phase::Prepared { summary, .. } => summary.txid.clone(),
+            _ => "00".repeat(32),
+        }
     }
 
     fn expect_marker(path: &Path) -> MarkerFile {
@@ -1115,11 +913,11 @@ mod tests {
     fn happy_path_hit_prepare_confirm_poll_confirmed() {
         let mut service = harness();
         service.on_verified_hit();
-        assert!(matches!(service.state(), ClaimState::AwaitingOwner { .. }));
+        assert!(matches!(service.state(), ClaimState::AwaitingOwner));
         let summary = service.prepare(DEST).expect("prepare");
         assert_eq!(summary.total_input_sat, 710_000_000);
-        let code = last_code(&service);
-        let receipt = service.confirm(DEST, &code).expect("confirm");
+        let preview_txid = prepared_txid(&service);
+        let receipt = service.confirm(DEST, &preview_txid).expect("confirm");
         assert_eq!(receipt.txid, summary.txid);
         assert_eq!(service.submitter.submit_count.get(), 1);
         service.poll();
@@ -1133,19 +931,19 @@ mod tests {
     }
 
     #[test]
-    fn confirm_without_prepare_and_destination_mismatch_are_not_failed_attempts() {
+    fn confirm_without_prepare_or_with_another_destination_never_submits() {
         let mut service = harness();
         service.on_verified_hit();
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("not prepared");
+        let preview_txid = prepared_txid(&service);
+        let err = service
+            .confirm(DEST, &preview_txid)
+            .expect_err("not prepared");
         assert_eq!(err, ServiceError::NotPrepared);
-        assert_eq!(service.failed_attempts, 0);
         assert_eq!(service.submitter.submit_count.get(), 0);
 
         service.prepare(DEST).expect("prepare");
-        let err = service.confirm(DEST2, &code).expect_err("dest");
+        let err = service.confirm(DEST2, &preview_txid).expect_err("dest");
         assert_eq!(err, ServiceError::DestinationMismatch);
-        assert_eq!(service.failed_attempts, 0);
         assert_eq!(service.submitter.submit_count.get(), 0);
         assert!(matches!(service.state(), ClaimState::Prepared { .. }));
     }
@@ -1165,87 +963,21 @@ mod tests {
             Phase::Prepared { destination, .. } => assert_eq!(destination, BECH32),
             _ => panic!("expected Prepared after prepare"),
         }
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service
-            .confirm(BECH32_UPPER, &code)
+            .confirm(BECH32_UPPER, &preview_txid)
             .expect("uppercase confirm matches canonical store");
         assert_eq!(service.submitter.submit_count.get(), 1);
 
         let mut other = harness();
         other.on_verified_hit();
         other.prepare(BECH32_UPPER).expect("prepare");
-        let code = last_code(&other);
+        let preview_txid = prepared_txid(&other);
         let err = other
-            .confirm(DEST2, &code)
+            .confirm(DEST2, &preview_txid)
             .expect_err("different destination");
         assert_eq!(err, ServiceError::DestinationMismatch);
         assert_eq!(other.submitter.submit_count.get(), 0);
-    }
-
-    #[test]
-    fn wrong_code_does_not_submit() {
-        let mut service = harness();
-        service.on_verified_hit();
-        service.prepare(DEST).unwrap();
-        let real = last_code(&service);
-        let err = service
-            .confirm(DEST, &wrong_code(&real))
-            .expect_err("wrong");
-        assert_eq!(err, ServiceError::WrongCode { remaining: 4 });
-        assert_eq!(service.submitter.submit_count.get(), 0);
-    }
-
-    #[test]
-    fn brute_force_lock_survives_resend_and_the_true_code() {
-        let mut service = harness();
-        service.on_verified_hit();
-        service.prepare(DEST).unwrap();
-        let mut real = last_code(&service);
-        for _ in 0..4 {
-            let err = service
-                .confirm(DEST, &wrong_code(&real))
-                .expect_err("wrong");
-            assert!(matches!(err, ServiceError::WrongCode { .. }));
-        }
-        service.resend_alert().expect("resend after four wrong");
-        real = last_code(&service);
-        let err = service
-            .confirm(DEST, &wrong_code(&real))
-            .expect_err("fifth wrong");
-        assert_eq!(err, ServiceError::Locked);
-        assert_eq!(service.state(), ClaimState::Locked);
-        assert_eq!(service.submitter.submit_count.get(), 0);
-        let err = service.confirm(DEST, &real).expect_err("true after lock");
-        assert_eq!(err, ServiceError::Locked);
-        assert_eq!(service.submitter.submit_count.get(), 0);
-    }
-
-    #[test]
-    fn fourth_resend_hits_the_limit() {
-        let mut service = harness();
-        service.on_verified_hit();
-        service.resend_alert().unwrap();
-        service.resend_alert().unwrap();
-        service.resend_alert().unwrap();
-        let err = service.resend_alert().expect_err("limit");
-        assert_eq!(err, ServiceError::ResendLimitReached);
-        assert_eq!(service.notifier.sends.get(), 4);
-    }
-
-    #[test]
-    fn second_confirm_after_consuming_the_code_is_no_code() {
-        let mut service = harness();
-        service.on_verified_hit();
-        let summary = service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        service.confirm(DEST, &code).unwrap();
-        let err = service.confirm(DEST, &code).expect_err("consumed");
-        assert_eq!(err, ServiceError::NoCode);
-        assert_eq!(service.submitter.submit_count.get(), 1);
-        assert!(matches!(
-            service.state(),
-            ClaimState::Submitted { txid, .. } if txid == summary.txid
-        ));
     }
 
     #[test]
@@ -1256,15 +988,15 @@ mod tests {
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("changed");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("changed");
         assert_eq!(err, ServiceError::SummaryChanged);
         assert_eq!(service.submitter.submit_count.get(), 0);
-        assert!(matches!(service.state(), ClaimState::AwaitingOwner { .. }));
-        service.prepare(DEST).expect("prepare after summary change");
+        assert!(matches!(service.state(), ClaimState::AwaitingOwner));
+        let refreshed = service.prepare(DEST).expect("prepare after summary change");
         service
-            .confirm(DEST, &code)
-            .expect("same code still valid after summary change");
+            .confirm(DEST, &refreshed.txid)
+            .expect("fresh preview confirmed");
         assert_eq!(service.submitter.submit_count.get(), 1);
     }
 
@@ -1281,7 +1013,7 @@ mod tests {
         service.on_verified_hit();
         let err = service.prepare(DEST).expect_err("6.9 btc");
         assert_eq!(err, ServiceError::BalanceBelowExpected);
-        assert!(matches!(service.state(), ClaimState::AwaitingOwner { .. }));
+        assert!(matches!(service.state(), ClaimState::AwaitingOwner));
     }
 
     #[test]
@@ -1290,21 +1022,21 @@ mod tests {
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
         write_test_marker(&service.marker_path, &"ab".repeat(32), "pending");
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("marker");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("marker");
         assert!(matches!(
             err,
             ServiceError::AlreadySubmittedDifferent { .. }
         ));
         assert_eq!(service.submitter.submit_count.get(), 0);
-        assert_eq!(service.failed_attempts, 0);
-        let err = service.confirm(DEST, &code).expect_err("still blocked");
+        let err = service
+            .confirm(DEST, &preview_txid)
+            .expect_err("still blocked");
         assert!(matches!(
             err,
             ServiceError::AlreadySubmittedDifferent { .. }
         ));
         assert_eq!(service.submitter.submit_count.get(), 0);
-        assert_eq!(service.failed_attempts, 0);
     }
 
     #[test]
@@ -1314,9 +1046,9 @@ mod tests {
         assert_eq!(service.state(), ClaimState::Idle);
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service
-            .confirm(DEST, &code)
+            .confirm(DEST, &preview_txid)
             .expect("rejected marker ignored");
         assert_eq!(service.submitter.submit_count.get(), 1);
     }
@@ -1328,8 +1060,8 @@ mod tests {
         service.submitter.status.set(TxStatus::NotFound);
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("rejected");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("rejected");
         assert_eq!(err, ServiceError::SubmissionRejected);
         assert_eq!(
             service.state(),
@@ -1345,8 +1077,8 @@ mod tests {
         service.submitter.status.set(TxStatus::Pending);
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("ambiguous");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("ambiguous");
         assert_eq!(err, ServiceError::SubmissionUnknown);
         let marker = expect_marker(&service.marker_path);
         assert_eq!(marker.outcome, "pending");
@@ -1389,21 +1121,13 @@ mod tests {
             ServiceError::InvalidState
         );
         service.on_verified_hit();
-        assert_eq!(service.notifier.sends.get(), 0);
         assert!(matches!(service.state(), ClaimState::Submitted { .. }));
     }
 
     #[test]
-    fn prepare_from_confirmed_locked_and_idle_is_invalid_state() {
+    fn prepare_from_confirmed_and_idle_is_invalid_state() {
         let mut idle = harness();
         assert_eq!(idle.prepare(DEST).unwrap_err(), ServiceError::InvalidState);
-
-        let mut locked = harness();
-        locked.phase = Phase::Locked { pending: None };
-        assert_eq!(
-            locked.prepare(DEST).unwrap_err(),
-            ServiceError::InvalidState
-        );
 
         let mut confirmed = harness();
         confirmed.phase = Phase::Confirmed {
@@ -1432,25 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn notifier_error_leaves_alert_sent_false() {
-        let mut service = harness();
-        service.notifier.fail.set(true);
-        service.on_verified_hit();
-        match service.state() {
-            ClaimState::AwaitingOwner { alert_sent, .. } => assert!(!alert_sent),
-            other => panic!("expected AwaitingOwner, got {other:?}"),
-        }
-        assert_eq!(service.notifier.sends.get(), 1);
-    }
-
-    #[test]
-    fn confirm_retries_same_code_after_utxo_net_error() {
+    fn confirm_retries_same_preview_after_utxo_net_error() {
         let mut service = harness();
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service.utxo.fail_remaining.set(1);
-        let err = service.confirm(DEST, &code).expect_err("net error");
+        let err = service.confirm(DEST, &preview_txid).expect_err("net error");
         assert!(
             matches!(
                 err,
@@ -1460,27 +1172,8 @@ mod tests {
         );
         assert!(matches!(service.state(), ClaimState::Prepared { .. }));
         assert_eq!(service.submitter.submit_count.get(), 0);
-        service.confirm(DEST, &code).expect("retry");
+        service.confirm(DEST, &preview_txid).expect("retry");
         assert_eq!(service.submitter.submit_count.get(), 1);
-    }
-
-    #[test]
-    fn consumed_code_after_rejected_or_ambiguous_submit_is_no_code() {
-        for mode in [SubmitMode::Rejected, SubmitMode::Ambiguous] {
-            let mut service = harness();
-            service.submitter.mode.set(mode);
-            if matches!(mode, SubmitMode::Rejected) {
-                service.submitter.status.set(TxStatus::NotFound);
-            }
-            service.on_verified_hit();
-            service.prepare(DEST).unwrap();
-            let code = last_code(&service);
-            service.confirm(DEST, &code).expect_err("submit attempt");
-            assert_eq!(service.submitter.submit_count.get(), 1);
-            let err = service.confirm(DEST, &code).expect_err("consumed");
-            assert_eq!(err, ServiceError::NoCode);
-            assert_eq!(service.submitter.submit_count.get(), 1);
-        }
     }
 
     #[test]
@@ -1488,8 +1181,8 @@ mod tests {
         let mut service = harness();
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        service.confirm(DEST, &code).unwrap();
+        let preview_txid = prepared_txid(&service);
+        service.confirm(DEST, &preview_txid).unwrap();
         service.submitter.status.set(TxStatus::NotFound);
         service.poll();
         assert!(matches!(
@@ -1505,38 +1198,16 @@ mod tests {
     }
 
     #[test]
-    fn resend_alert_from_locked_or_submitted_is_invalid_state() {
-        let mut locked = harness();
-        locked.phase = Phase::Locked { pending: None };
-        assert_eq!(
-            locked.resend_alert().unwrap_err(),
-            ServiceError::InvalidState
-        );
-
-        let mut submitted = harness();
-        submitted.phase = Phase::Submitted {
-            txid: "aa".repeat(32),
-            submitted_at_unix: 1,
-            not_found_polls: 0,
-        };
-        assert_eq!(
-            submitted.resend_alert().unwrap_err(),
-            ServiceError::InvalidState
-        );
-    }
-
-    #[test]
     fn prepare_from_failed_rejected_is_allowed() {
         let mut service = harness();
         service.submitter.mode.set(SubmitMode::Rejected);
         service.submitter.status.set(TxStatus::NotFound);
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        service.confirm(DEST, &code).expect_err("rejected");
+        let preview_txid = prepared_txid(&service);
+        service.confirm(DEST, &preview_txid).expect_err("rejected");
         assert!(matches!(service.state(), ClaimState::Failed { .. }));
         service.submitter.mode.set(SubmitMode::Success);
-        service.resend_alert().expect("new code");
         let summary = service.prepare(DEST).expect("prepare from failed");
         assert_eq!(summary.total_input_sat, 710_000_000);
         assert!(matches!(service.state(), ClaimState::Prepared { .. }));
@@ -1572,10 +1243,11 @@ mod tests {
                 reason: "submission_not_found".to_string()
             }
         );
-        service.resend_alert().expect("code after failed");
         service.prepare(DEST).expect("prepare after not found");
-        let code = last_code(&service);
-        service.confirm(DEST, &code).expect("same txid resubmit");
+        let preview_txid = prepared_txid(&service);
+        service
+            .confirm(DEST, &preview_txid)
+            .expect("same txid resubmit");
         assert_eq!(service.submitter.submit_count.get(), 1);
     }
 
@@ -1591,13 +1263,14 @@ mod tests {
         for _ in 0..MAX_NOT_FOUND_POLLS {
             service.poll();
         }
-        service.resend_alert().expect("code");
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
         service.prepare(DEST).expect("new summary");
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("different txid");
+        let preview_txid = prepared_txid(&service);
+        let err = service
+            .confirm(DEST, &preview_txid)
+            .expect_err("different txid");
         assert!(matches!(
             err,
             ServiceError::AlreadySubmittedDifferent { txid: t } if t == txid
@@ -1632,61 +1305,6 @@ mod tests {
     }
 
     #[test]
-    fn claim_state_json_contains_neither_code_nor_pubkey_nor_tx_hex() {
-        let mut service = harness();
-        service.on_verified_hit();
-        let code = last_code(&service);
-        let summary = service.prepare(DEST).unwrap();
-        let key = test_support::test_claim_key();
-        let pubkey_bytes = key.compressed_pubkey_bytes();
-        let pubkey_hex = pubkey_bytes.as_slice().to_lower_hex_string();
-        let claim = build_signed_claim(
-            &key,
-            &economic_prevouts(),
-            &parse_destination(
-                DEST,
-                Network::Bitcoin,
-                p2pkh_script_for_hash160(TARGET_HASH160).as_script(),
-            )
-            .unwrap(),
-            DEFAULT_FEE_RATE_SAT_VB,
-        )
-        .unwrap();
-        let tx_hex = claim.raw_tx_bytes_for_submission().to_lower_hex_string();
-
-        for state in [
-            service.state(),
-            ClaimState::Idle,
-            ClaimState::Locked,
-            ClaimState::Failed {
-                reason: "submission_rejected".to_string(),
-            },
-            ClaimState::Submitted {
-                txid: summary.txid.clone(),
-                submitted_at_unix: 1,
-            },
-        ] {
-            let json = serde_json::to_string(&state).unwrap();
-            assert!(
-                !json.contains(&format!("\"{code}\"")),
-                "quoted code leaked in {json}"
-            );
-            let known_numeric = [
-                summary.total_input_sat.to_string(),
-                summary.output_sat.to_string(),
-                summary.fee_sat.to_string(),
-                summary.vsize.to_string(),
-                summary.txid.clone(),
-            ];
-            if !known_numeric.iter().any(|field| field.contains(&code)) {
-                assert!(!json.contains(&code), "unquoted code leaked in {json}");
-            }
-            assert!(!json.contains(&pubkey_hex), "pubkey leaked in {json}");
-            assert!(!json.contains(&tx_hex), "tx hex leaked in {json}");
-        }
-    }
-
-    #[test]
     fn new_with_rejected_marker_is_idle_then_hit_and_prepare() {
         let dir = temp_dir();
         let marker_path = dir.join("marker.json");
@@ -1697,7 +1315,7 @@ mod tests {
         };
         assert_eq!(service.state(), ClaimState::Idle);
         service.on_verified_hit();
-        assert!(matches!(service.state(), ClaimState::AwaitingOwner { .. }));
+        assert!(matches!(service.state(), ClaimState::AwaitingOwner));
         service.prepare(DEST).expect("prepare allowed");
         assert!(matches!(service.state(), ClaimState::Prepared { .. }));
     }
@@ -1707,8 +1325,8 @@ mod tests {
         let mut service = harness();
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        service.confirm(DEST, &code).unwrap();
+        let preview_txid = prepared_txid(&service);
+        service.confirm(DEST, &preview_txid).unwrap();
         service.submitter.status.set(TxStatus::NotFound);
         for _ in 0..29 {
             service.poll();
@@ -1741,11 +1359,11 @@ mod tests {
     }
 
     #[test]
-    fn confirm_keeps_the_code_when_the_marker_cannot_be_written() {
+    fn confirm_keeps_the_preview_when_the_marker_cannot_be_written() {
         let mut service = harness();
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         let missing = service
             .marker_path
             .parent()
@@ -1753,10 +1371,12 @@ mod tests {
             .join("no-such-dir")
             .join("marker.json");
         service.marker_path = missing;
-        let err = service.confirm(DEST, &code).expect_err("storage");
+        let err = service.confirm(DEST, &preview_txid).expect_err("storage");
         assert_eq!(err, ServiceError::Storage);
         assert_eq!(service.submitter.submit_count.get(), 0);
-        let err = service.confirm(DEST, &code).expect_err("still storage");
+        let err = service
+            .confirm(DEST, &preview_txid)
+            .expect_err("still storage");
         assert_eq!(err, ServiceError::Storage);
         assert_eq!(service.submitter.submit_count.get(), 0);
         assert!(matches!(service.state(), ClaimState::Prepared { .. }));
@@ -1768,29 +1388,29 @@ mod tests {
         service.on_verified_hit();
         let summary_a = service.prepare(DEST).unwrap();
         let txid_a = summary_a.txid.clone();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service.submitter.mode.set(SubmitMode::Ambiguous);
-        service.confirm(DEST, &code).expect_err("ambiguous");
+        service.confirm(DEST, &preview_txid).expect_err("ambiguous");
         assert_eq!(service.submitter.submit_count.get(), 1);
 
         service.submitter.mode.set(SubmitMode::Rejected);
-        service.resend_alert().expect("code");
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("rejected resubmit");
+        let preview_txid = prepared_txid(&service);
+        let err = service
+            .confirm(DEST, &preview_txid)
+            .expect_err("rejected resubmit");
         assert_eq!(err, ServiceError::SubmissionUnknown);
         assert_eq!(service.submitter.submit_count.get(), 2);
         let marker = expect_marker(&service.marker_path);
         assert_eq!(marker.outcome, "pending");
         assert_eq!(marker.txid, txid_a);
 
-        service.resend_alert().expect("code for B");
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
         service.prepare(DEST).expect("prepare B");
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("B blocked");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("B blocked");
         assert!(matches!(
             err,
             ServiceError::AlreadySubmittedDifferent { txid } if txid == txid_a
@@ -1805,8 +1425,10 @@ mod tests {
         service.submitter.status.set(TxStatus::Pending);
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        let receipt = service.confirm(DEST, &code).expect("treated as submitted");
+        let preview_txid = prepared_txid(&service);
+        let receipt = service
+            .confirm(DEST, &preview_txid)
+            .expect("treated as submitted");
         assert_eq!(receipt.txid, summary.txid);
         assert_eq!(service.submitter.submit_count.get(), 1);
         assert!(matches!(
@@ -1824,8 +1446,8 @@ mod tests {
         service.submitter.status.set(TxStatus::NotFound);
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("rejected");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("rejected");
         assert_eq!(err, ServiceError::SubmissionRejected);
         assert_eq!(service.submitter.submit_count.get(), 1);
         assert_eq!(
@@ -1844,8 +1466,10 @@ mod tests {
         service.submitter.status_err.set(true);
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("status err");
+        let preview_txid = prepared_txid(&service);
+        let err = service
+            .confirm(DEST, &preview_txid)
+            .expect_err("status err");
         assert_eq!(err, ServiceError::SubmissionUnknown);
         assert_eq!(service.submitter.submit_count.get(), 1);
         assert_eq!(
@@ -1865,17 +1489,16 @@ mod tests {
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
         let txid = summary.txid.clone();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service.submitter.mode.set(SubmitMode::Ambiguous);
-        service.confirm(DEST, &code).expect_err("ambiguous");
+        service.confirm(DEST, &preview_txid).expect_err("ambiguous");
         service.submitter.mode.set(SubmitMode::Success);
-        service.resend_alert().expect("code");
         service.prepare(DEST).expect("prepare");
         service.submitter.fee_floor.set(DEFAULT_FEE_RATE_SAT_VB + 1);
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("floor");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("floor");
         assert_eq!(err, ServiceError::SummaryChanged);
-        assert!(matches!(service.state(), ClaimState::AwaitingOwner { .. }));
+        assert!(matches!(service.state(), ClaimState::AwaitingOwner));
         assert_eq!(service.submitter.submit_count.get(), 1);
         service
             .submitter
@@ -1897,19 +1520,18 @@ mod tests {
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
         let txid = summary.txid.clone();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service.submitter.mode.set(SubmitMode::Ambiguous);
-        service.confirm(DEST, &code).expect_err("ambiguous");
+        service.confirm(DEST, &preview_txid).expect_err("ambiguous");
         service.submitter.mode.set(SubmitMode::Success);
-        service.resend_alert().expect("code");
         service.prepare(DEST).expect("prepare");
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("changed");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("changed");
         assert_eq!(err, ServiceError::SummaryChanged);
-        assert!(matches!(service.state(), ClaimState::AwaitingOwner { .. }));
+        assert!(matches!(service.state(), ClaimState::AwaitingOwner));
         assert_eq!(service.submitter.submit_count.get(), 1);
         service
             .submitter
@@ -1921,37 +1543,6 @@ mod tests {
             ClaimState::Confirmed {
                 txid,
                 block_height: 12
-            }
-        );
-    }
-
-    #[test]
-    fn locked_with_pending_still_polls_to_confirmed() {
-        let mut service = harness();
-        service.on_verified_hit();
-        let summary = service.prepare(DEST).unwrap();
-        let txid = summary.txid.clone();
-        let code = last_code(&service);
-        service.submitter.mode.set(SubmitMode::Ambiguous);
-        service.confirm(DEST, &code).expect_err("ambiguous");
-        service.resend_alert().expect("code");
-        service.prepare(DEST).unwrap();
-        let real = last_code(&service);
-        for _ in 0..5 {
-            let _ = service.confirm(DEST, &wrong_code(&real));
-        }
-        assert_eq!(service.state(), ClaimState::Locked);
-        assert_eq!(service.submitter.submit_count.get(), 1);
-        service
-            .submitter
-            .status
-            .set(TxStatus::Confirmed { block_height: 13 });
-        service.poll();
-        assert_eq!(
-            service.state(),
-            ClaimState::Confirmed {
-                txid,
-                block_height: 13
             }
         );
     }
@@ -2084,10 +1675,10 @@ mod tests {
         let mut service = harness();
         service.on_verified_hit();
         service.prepare(DEST).unwrap();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         let as_dir = temp_dir();
         service.marker_path = as_dir.0.clone();
-        let err = service.confirm(DEST, &code).expect_err("storage");
+        let err = service.confirm(DEST, &preview_txid).expect_err("storage");
         assert_eq!(err, ServiceError::Storage);
         assert_eq!(service.submitter.submit_count.get(), 0);
     }
@@ -2107,10 +1698,9 @@ mod tests {
                 reason: "marker_unreadable".to_string()
             }
         );
-        service.resend_alert().expect("code");
         service.prepare(DEST).expect("prepare allowed");
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("storage");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("storage");
         assert_eq!(err, ServiceError::Storage);
         assert_eq!(service.submitter.submit_count.get(), 0);
     }
@@ -2130,10 +1720,9 @@ mod tests {
                 reason: "marker_unreadable".to_string()
             }
         );
-        service.resend_alert().expect("code");
         service.prepare(DEST).expect("prepare allowed");
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("storage");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("storage");
         assert_eq!(err, ServiceError::Storage);
         assert_eq!(service.submitter.submit_count.get(), 0);
     }
@@ -2144,19 +1733,18 @@ mod tests {
         service.on_verified_hit();
         let summary_a = service.prepare(DEST).unwrap();
         let txid_a = summary_a.txid.clone();
-        let code = last_code(&service);
+        let preview_txid = prepared_txid(&service);
         service.submitter.mode.set(SubmitMode::Ambiguous);
-        service.confirm(DEST, &code).expect_err("ambiguous");
+        service.confirm(DEST, &preview_txid).expect_err("ambiguous");
         assert_eq!(service.submitter.submit_count.get(), 1);
         fs::remove_file(&service.marker_path).expect("delete marker");
 
-        service.resend_alert().expect("code for B");
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
         service.prepare(DEST).expect("prepare B");
-        let code = last_code(&service);
-        let err = service.confirm(DEST, &code).expect_err("B blocked");
+        let preview_txid = prepared_txid(&service);
+        let err = service.confirm(DEST, &preview_txid).expect_err("B blocked");
         assert!(matches!(
             err,
             ServiceError::AlreadySubmittedDifferent { txid } if txid == txid_a
@@ -2173,7 +1761,7 @@ mod tests {
             .mode(mode)
             .open(path)
             .unwrap();
-        write!(file, "PRIVATE KEY (HEX):       0x{scalar:018x}\n").unwrap();
+        writeln!(file, "PRIVATE KEY (HEX):       0x{scalar:018x}").unwrap();
     }
 
     #[test]
@@ -2249,5 +1837,133 @@ mod tests {
         );
         assert!(!warning.to_ascii_lowercase().contains("private"));
         assert!(!warning.contains("0x"));
+    }
+    #[test]
+    fn wallet_preview_needs_no_notifier_and_prepare_never_submits() {
+        let mut service = harness();
+        service.on_verified_hit();
+        assert_eq!(service.state(), ClaimState::AwaitingOwner);
+        let preview = service.prepare(DEST).unwrap();
+        assert_eq!(preview.destination, DEST);
+        assert_eq!(service.submitter.submit_count.get(), 0);
+        assert!(
+            !serde_json::to_string(&service.state())
+                .unwrap()
+                .contains("code")
+        );
+        service.confirm(DEST, &preview.txid).unwrap();
+        assert_eq!(service.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn confirming_a_different_prepared_txid_does_not_submit() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let a = service.prepare(DEST).unwrap();
+        let b = service.prepare(DEST2).unwrap();
+        assert_ne!(a.txid, b.txid);
+        assert_eq!(
+            service.confirm(DEST2, &a.txid).unwrap_err(),
+            ServiceError::PreparedTxidMismatch
+        );
+        assert_eq!(
+            service.confirm(DEST2, "").unwrap_err(),
+            ServiceError::PreparedTxidMismatch
+        );
+        assert_eq!(service.submitter.submit_count.get(), 0);
+        service.confirm(DEST2, &b.txid).unwrap();
+        assert_eq!(service.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn failed_reprepare_invalidates_the_old_preview() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let a = service.prepare(DEST).unwrap();
+        assert!(service.prepare("invalid destination").is_err());
+        assert_eq!(
+            service.confirm(DEST, &a.txid).unwrap_err(),
+            ServiceError::NotPrepared
+        );
+        assert_eq!(service.submitter.submit_count.get(), 0);
+    }
+
+    #[test]
+    fn duplicate_confirm_returns_receipt_without_a_second_submit() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let preview = service.prepare(DEST).unwrap();
+        let first = service.confirm(DEST, &preview.txid).unwrap();
+        let second = service.confirm(DEST, &preview.txid).unwrap();
+        assert_eq!(first.txid, second.txid);
+        assert_eq!(service.submitter.submit_count.get(), 1);
+        assert_eq!(
+            service.confirm(DEST2, &preview.txid).unwrap_err(),
+            ServiceError::DestinationMismatch
+        );
+        assert_eq!(service.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn marker_directory_sync_error_prevents_submission_and_can_be_retried() {
+        fn fail_sync(_: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected directory sync failure"))
+        }
+        let mut service = harness();
+        service.on_verified_hit();
+        let preview = service.prepare(DEST).unwrap();
+        service.directory_sync = fail_sync;
+        assert_eq!(
+            service.confirm(DEST, &preview.txid).unwrap_err(),
+            ServiceError::Storage
+        );
+        assert_eq!(service.submitter.submit_count.get(), 0);
+        assert!(matches!(service.state(), ClaimState::Prepared { .. }));
+        assert_eq!(expect_marker(&service.marker_path).txid, preview.txid);
+        service.directory_sync = super::sync_directory;
+        service.confirm(DEST, &preview.txid).unwrap();
+        assert_eq!(service.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn claim_state_never_serializes_signing_material() {
+        use bitcoin::hex::DisplayHex;
+        let mut service = harness();
+        service.on_verified_hit();
+        let summary = service.prepare(DEST).unwrap();
+        let key = test_support::test_claim_key();
+        let address = crate::claim::parse_destination(
+            DEST,
+            bitcoin::Network::Bitcoin,
+            p2pkh_script_for_hash160(key.hash160()).as_script(),
+        )
+        .unwrap();
+        let signed = crate::claim::build_signed_claim(
+            &key,
+            &economic_prevouts(),
+            &address,
+            DEFAULT_FEE_RATE_SAT_VB,
+        )
+        .unwrap();
+        let pubkey_hex = key.compressed_pubkey_bytes().to_lower_hex_string();
+        let raw_hex = signed.raw_tx_bytes_for_submission().to_lower_hex_string();
+        for state in [
+            service.state(),
+            ClaimState::AwaitingOwner,
+            ClaimState::Submitted {
+                txid: summary.txid,
+                submitted_at_unix: 1,
+            },
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert!(!json.contains(&pubkey_hex));
+            assert!(!json.contains(&raw_hex));
+            for forbidden in ["code", "private", "pubkey", "raw_tx"] {
+                assert!(
+                    !json.contains(forbidden),
+                    "unexpected secret field in {json}"
+                );
+            }
+        }
     }
 }

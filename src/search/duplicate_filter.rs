@@ -58,21 +58,26 @@ impl IntervalSet {
 
     /// Insert a block index, merging adjacent intervals automatically
     pub fn insert(&mut self, block_idx: u64) {
-        if self.contains(block_idx) {
+        let idx = self
+            .intervals
+            .partition_point(|&(start, _)| start <= block_idx);
+        if idx > 0 && self.intervals[idx - 1].1 >= block_idx {
             return;
         }
-
-        // Find insertion point
-        let idx = match self
+        let joins_left = idx > 0 && self.intervals[idx - 1].1.checked_add(1) == Some(block_idx);
+        let joins_right = self
             .intervals
-            .binary_search_by_key(&block_idx, |&(start, _)| start)
-        {
-            Ok(i) => i,
-            Err(i) => i,
-        };
-
-        self.intervals.insert(idx, (block_idx, block_idx));
-        self.consolidate();
+            .get(idx)
+            .is_some_and(|&(start, _)| block_idx.checked_add(1) == Some(start));
+        match (joins_left, joins_right) {
+            (true, true) => {
+                self.intervals[idx - 1].1 = self.intervals[idx].1;
+                self.intervals.remove(idx);
+            }
+            (true, false) => self.intervals[idx - 1].1 = block_idx,
+            (false, true) => self.intervals[idx].0 = block_idx,
+            (false, false) => self.intervals.insert(idx, (block_idx, block_idx)),
+        }
     }
 
     /// Insert an entire continuous block range [start, end] (inclusive)
@@ -189,9 +194,20 @@ impl DuplicateFilter {
 
     pub fn from_intervals(intervals: IntervalSet) -> Self {
         let mut filter = Self::new();
-        for &(start, end) in &intervals.intervals {
-            for b in start..=end {
-                filter.bloom.insert(b);
+        // Long merged intervals can represent trillions of blocks. Rebuilding each bit
+        // would prevent an otherwise valid completed checkpoint from ever starting.
+        let covered = intervals.intervals.iter().fold(0u64, |sum, &(start, end)| {
+            sum.saturating_add(end.saturating_sub(start).saturating_add(1))
+        });
+        if covered > 1_000_000 {
+            // A saturated Bloom filter has only false positives, all resolved by the
+            // authoritative interval lookup. It can never skip an unsearched block.
+            filter.bloom.bits.fill(u64::MAX);
+        } else {
+            for &(start, end) in &intervals.intervals {
+                for b in start..=end {
+                    filter.bloom.insert(b);
+                }
             }
         }
         filter.intervals = intervals;
@@ -210,5 +226,42 @@ impl DuplicateFilter {
     pub fn mark_scanned(&mut self, block_idx: u64) {
         self.bloom.insert(block_idx);
         self.intervals.insert(block_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn singleton_insertion_merges_both_neighbours_and_ignores_duplicates() {
+        let mut intervals = IntervalSet::new();
+        for index in [8, 2, 4, 3, 7, 5, 6, 2] {
+            intervals.insert(index);
+        }
+        assert_eq!(intervals.intervals, vec![(2, 8)]);
+        assert_eq!(intervals.total_blocks_count(), 7);
+        assert!(!intervals.contains(1));
+        assert!(!intervals.contains(9));
+    }
+
+    #[test]
+    fn singleton_insertion_handles_u64_boundaries_without_wrapping() {
+        let mut intervals = IntervalSet::new();
+        for index in [u64::MAX, 0, u64::MAX - 1, 1] {
+            intervals.insert(index);
+        }
+        assert_eq!(intervals.intervals, vec![(0, 1), (u64::MAX - 1, u64::MAX)]);
+    }
+
+    #[test]
+    fn merged_large_intervals_keep_exact_membership_with_a_bounded_bloom_rebuild() {
+        let filter = DuplicateFilter::from_intervals(IntervalSet {
+            intervals: vec![(1, u64::MAX - 1)],
+        });
+        assert!(!filter.is_scanned(0));
+        assert!(filter.is_scanned(1));
+        assert!(filter.is_scanned(u64::MAX - 1));
+        assert!(!filter.is_scanned(u64::MAX));
     }
 }
