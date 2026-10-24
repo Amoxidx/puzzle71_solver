@@ -166,6 +166,11 @@ test.describe("Puzzle #71 dashboard", () => {
   });
 
   test("reduced-motion rules independently stop the status pulse and pressed-button movement", async ({ page }) => {
+    let interceptedStops = 0;
+    await page.route("**/api/stop", (route) => {
+      interceptedStops += 1;
+      return route.fulfill({ json: { status: "stopped" } });
+    });
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.route("**/api/status", (route) => route.fulfill({ json: {
       is_running: true, mode: "HIGH", total_keys_tested: "0", total_blocks_tested: 0,
@@ -181,6 +186,7 @@ test.describe("Puzzle #71 dashboard", () => {
     await page.mouse.down();
     await expect(button).toHaveCSS("transform", "none");
     await page.mouse.up();
+    await expect.poll(() => interceptedStops).toBe(1);
   });
 
   test("power model is unavailable before the first GPU dispatch", async ({ page }) => {
