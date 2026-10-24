@@ -12,6 +12,7 @@ use bitcoin::consensus;
 use bitcoin::{Address, Script, Sequence, Transaction, TxOut, Txid, absolute};
 use serde::Serialize;
 
+use crate::claim::destination::validate_destination_type;
 use crate::claim::error::ClaimError;
 use crate::claim::policy::{self, MAX_FEE_RATE_SAT_VB, MIN_FEE_RATE_SAT_VB};
 use crate::claim::prevout::VerifiedPrevout;
@@ -91,6 +92,7 @@ pub fn verify_signed_claim(
     if !(MIN_FEE_RATE_SAT_VB..=MAX_FEE_RATE_SAT_VB).contains(&fee_rate_sat_vb) {
         return Err(ClaimError::FeeRateOutOfBounds);
     }
+    validate_destination_type(destination)?;
 
     // Independent of the builder: reject a duplicate outpoint among the supplied prevouts before
     // trusting any of them, rather than relying on the builder to have already checked this.
@@ -102,6 +104,9 @@ pub fn verify_signed_claim(
     }
 
     let tx: Transaction = consensus::deserialize(raw).map_err(|_| ClaimError::ClaimTxDecode)?;
+    if tx.weight().to_wu() > policy::MAX_CLAIM_WEIGHT_WU {
+        return Err(ClaimError::TransactionTooLarge);
+    }
     if consensus::serialize(&tx) != raw {
         return Err(ClaimError::SerializationMismatch);
     }
@@ -128,23 +133,21 @@ pub fn verify_signed_claim(
         return Err(ClaimError::NonZeroLocktime);
     }
 
-    // The prevouts this transaction is allowed to spend: exactly those independently verified
-    // prevouts that are economic at `fee_rate_sat_vb`, recomputed here from scratch rather than
-    // trusted from the builder.
-    let mut economic_outpoints: BTreeSet<(Txid, u32)> = BTreeSet::new();
+    // Recompute the payout-optimal input set from the independently verified prevouts;
+    // never trust the builder's selected inputs or intermediate totals.
+    let economic_outpoints: BTreeSet<(Txid, u32)> =
+        policy::select_prevouts(prevouts, &destination.script_pubkey(), fee_rate_sat_vb)?
+            .iter()
+            .map(|p| (p.outpoint().txid, p.outpoint().vout))
+            .collect();
     let mut excluded_dust_count = 0usize;
     let mut excluded_dust_sat = 0u64;
     for prevout in prevouts {
         let value = prevout.txout().value.to_sat();
-        if policy::is_economic(value, fee_rate_sat_vb) {
-            economic_outpoints.insert((prevout.outpoint().txid, prevout.outpoint().vout));
-        } else {
+        if !economic_outpoints.contains(&(prevout.outpoint().txid, prevout.outpoint().vout)) {
             excluded_dust_count += 1;
             excluded_dust_sat += value;
         }
-    }
-    if economic_outpoints.is_empty() {
-        return Err(ClaimError::NoEconomicInputs);
     }
 
     let mut seen: BTreeSet<(Txid, u32)> = BTreeSet::new();
@@ -563,5 +566,62 @@ mod tests {
         raw.push(0x00);
         let err = verify_signed_claim(&raw, &prevouts, &destination, fee_rate).unwrap_err();
         assert_eq!(err, ClaimError::ClaimTxDecode);
+    }
+
+    #[test]
+    fn wallet_verifier_rejects_invalid_taproot_independent_of_builder() {
+        use bitcoin::secp256k1::{Message, Secp256k1};
+        use bitcoin::{EcdsaSighashType, ecdsa, script, sighash::SighashCache};
+        let (mut tx, prevouts, _, fee_rate) = valid_claim_fixture();
+        let address: Address<bitcoin::address::NetworkUnchecked> =
+            "bc1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqqenm"
+                .parse()
+                .unwrap();
+        let address = address.assume_checked();
+        tx.output[0].script_pubkey = address.script_pubkey();
+        tx.output[0].value = Amount::from_sat(
+            prevouts[0].txout().value.to_sat()
+                - policy::max_vsize(1, &address.script_pubkey()) * fee_rate,
+        );
+        let key = test_support::test_claim_key();
+        let digest = SighashCache::new(&tx)
+            .legacy_signature_hash(
+                0,
+                &prevouts[0].txout().script_pubkey,
+                EcdsaSighashType::All.to_u32(),
+            )
+            .unwrap();
+        let signature = Secp256k1::signing_only().sign_ecdsa_low_r(
+            &Message::from_digest(digest.to_byte_array()),
+            key.secret_key(),
+        );
+        let signature =
+            script::PushBytesBuf::try_from(ecdsa::Signature::sighash_all(signature).to_vec())
+                .unwrap();
+        tx.input[0].script_sig = script::Builder::new()
+            .push_slice(signature)
+            .push_slice(key.compressed_pubkey_bytes())
+            .into_script();
+        assert!(tx.verify(|_| Some(prevouts[0].txout().clone())).is_ok());
+        assert_eq!(
+            verify_signed_claim(&consensus::serialize(&tx), &prevouts, &address, fee_rate),
+            Err(ClaimError::InvalidAddress)
+        );
+    }
+
+    #[test]
+    fn wallet_verifier_rejects_actual_weight_above_consensus_limit() {
+        let (mut tx, prevouts, destination, fee_rate) = valid_claim_fixture();
+        tx.input[0].script_sig = ScriptBuf::from_bytes(vec![0; 1_000_000]);
+        assert!(tx.weight().to_wu() > 4_000_000);
+        assert_eq!(
+            verify_signed_claim(
+                &consensus::serialize(&tx),
+                &prevouts,
+                &destination,
+                fee_rate
+            ),
+            Err(ClaimError::TransactionTooLarge)
+        );
     }
 }

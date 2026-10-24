@@ -1,5 +1,6 @@
 //! Owner-driven claim flow: address, verified preview, explicit submission, and status.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::ops::RangeInclusive;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bitcoin::Network;
+use bitcoin::{Network, OutPoint};
 use serde::{Deserialize, Serialize};
 
 use crate::claim::builder::build_signed_claim;
@@ -62,6 +63,8 @@ impl KeySource for FoundKeyFile {
 pub struct FoundKeyScan {
     /// First file (sorted by path) that loaded as a matching key.
     pub found: Option<PathBuf>,
+    /// Original record time, when unique and valid; never inferred from file modification time.
+    pub timestamp_unix: Option<u64>,
     /// Files that existed but could not be loaded, in sorted path order.
     /// Each pair is `(file_name, reason)` — no directory path and no key material.
     pub unloadable: Vec<(String, ClaimError)>,
@@ -90,6 +93,7 @@ pub fn find_verified_found_key(
         Err(_) => {
             return FoundKeyScan {
                 found: None,
+                timestamp_unix: None,
                 unloadable: Vec::new(),
             };
         }
@@ -97,10 +101,12 @@ pub fn find_verified_found_key(
     paths.sort();
     let mut unloadable = Vec::new();
     for path in paths {
-        match ClaimKey::load_found_key_file(&path, expected_hash160, range.clone()) {
-            Ok(_) => {
+        match ClaimKey::load_found_key_file_with_timestamp(&path, expected_hash160, range.clone()) {
+            Ok((key, timestamp_unix)) => {
+                drop(key);
                 return FoundKeyScan {
                     found: Some(path),
+                    timestamp_unix,
                     unloadable,
                 };
             }
@@ -116,6 +122,7 @@ pub fn find_verified_found_key(
     }
     FoundKeyScan {
         found: None,
+        timestamp_unix: None,
         unloadable,
     }
 }
@@ -139,6 +146,15 @@ pub enum ClaimState {
     Failed {
         reason: String,
     },
+}
+
+/// Public status freshness, kept separate from the stable claim-state API.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct ClaimStatusDetails {
+    pub pending_txid: Option<String>,
+    pub last_success_unix: Option<u64>,
+    pub last_attempt_unix: Option<u64>,
+    pub unavailable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,15 +250,26 @@ pub struct ClaimService<U: UtxoSource, S: Submitter, K: KeySource> {
     network: Network,
     submitted_destination: Option<String>,
     directory_sync: fn(&Path) -> std::io::Result<()>,
+    pending_marker: Option<MarkerFile>,
+    status_details: ClaimStatusDetails,
+    recovery_not_found_polls: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct MarkerFile {
     txid: String,
     destination: String,
     fee_rate_sat_vb: u64,
     written_at_unix: u64,
     outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_inputs: Option<Vec<MarkerInput>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct MarkerInput {
+    txid: String,
+    vout: u32,
 }
 
 impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
@@ -260,13 +287,14 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
         network: Network,
     ) -> Self {
         let mut submitted_destination = None;
+        let mut pending_marker = None;
         let phase = match read_marker(&marker_path) {
             Ok(Some(marker)) if marker.outcome == "pending" => {
-                submitted_destination = Some(marker.destination);
-                Phase::Submitted {
-                    txid: marker.txid,
-                    submitted_at_unix: marker.written_at_unix,
-                    not_found_polls: 0,
+                submitted_destination = Some(marker.destination.clone());
+                pending_marker = Some(marker.clone());
+                Phase::Failed {
+                    reason: "submission_unknown".to_string(),
+                    pending: Some((marker.txid, marker.written_at_unix)),
                 }
             }
             Ok(_) => Phase::Idle,
@@ -284,7 +312,41 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
             network,
             submitted_destination,
             directory_sync: sync_directory,
+            pending_marker,
+            status_details: ClaimStatusDetails::default(),
+            recovery_not_found_polls: 0,
         }
+    }
+
+    pub fn status_details(&self) -> ClaimStatusDetails {
+        let mut details = self.status_details.clone();
+        details.pending_txid = match &self.phase {
+            Phase::AwaitingOwner { pending }
+            | Phase::Prepared { pending, .. }
+            | Phase::Failed { pending, .. } => pending.as_ref().map(|(id, _)| id.clone()),
+            Phase::Submitted { txid, .. } => Some(txid.clone()),
+            _ => None,
+        };
+        details
+    }
+
+    fn query_status(&mut self, txid: &str) -> Result<TxStatus, NetError> {
+        let now = unix_secs();
+        self.status_details.last_attempt_unix = Some(now);
+        let result = self.submitter.status(txid);
+        self.status_details.unavailable = result.is_err();
+        if result.is_ok() {
+            self.status_details.last_success_unix = Some(now);
+        }
+        result
+    }
+
+    fn recovery_marker(&self) -> Option<MarkerFile> {
+        read_marker(&self.marker_path)
+            .ok()
+            .flatten()
+            .filter(|marker| marker.outcome == "pending")
+            .or_else(|| self.pending_marker.clone())
     }
 
     pub fn state(&self) -> ClaimState {
@@ -334,12 +396,31 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
         let key = self.key_source.load()?;
         let puzzle_script = p2pkh_script_for_hash160(key.hash160());
         let address = parse_destination(destination, self.network, puzzle_script.as_script())?;
-        let fee_rate = DEFAULT_FEE_RATE_SAT_VB.max(self.submitter.fee_floor_sat_vb()?);
+        let recovery = self.recovery_marker();
+        let floor = self.submitter.fee_floor_sat_vb()?;
+        let fee_rate = if let Some(marker) = &recovery {
+            if marker.destination != address.to_string() {
+                return Err(ServiceError::DestinationMismatch);
+            }
+            if floor > marker.fee_rate_sat_vb {
+                return Err(ServiceError::SummaryChanged);
+            }
+            marker.fee_rate_sat_vb
+        } else {
+            DEFAULT_FEE_RATE_SAT_VB.max(floor)
+        };
         if fee_rate > MAX_FEE_RATE_SAT_VB {
             return Err(ServiceError::FeeFloorTooHigh);
         }
         let snapshot = self.utxo.fetch_verified_prevouts()?;
-        let claim = build_signed_claim(&key, &snapshot.prevouts, &address, fee_rate)?;
+        let prevouts = retry_prevouts(recovery.as_ref(), &snapshot.prevouts)?;
+        let claim = build_signed_claim(&key, &prevouts, &address, fee_rate)?;
+        if let Some(marker) = &recovery
+            && marker.original_inputs.is_some()
+            && marker.txid != claim.summary().txid
+        {
+            return Err(ServiceError::SummaryChanged);
+        }
         if claim.summary().total_input_sat < MIN_EXPECTED_ECONOMIC_TOTAL_SAT {
             return Err(ServiceError::BalanceBelowExpected);
         }
@@ -420,7 +501,18 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
         }
         let key = self.key_source.load()?;
         let snapshot = self.utxo.fetch_verified_prevouts()?;
-        let claim = build_signed_claim(&key, &snapshot.prevouts, &address, prepared_rate)?;
+        let recovery = file_marker
+            .as_ref()
+            .filter(|marker| marker.outcome == "pending")
+            .or(self.pending_marker.as_ref());
+        let prevouts = match retry_prevouts(recovery, &snapshot.prevouts) {
+            Ok(prevouts) => prevouts,
+            Err(err) => {
+                self.phase = Phase::AwaitingOwner { pending };
+                return Err(err);
+            }
+        };
+        let claim = build_signed_claim(&key, &prevouts, &address, prepared_rate)?;
         if claim.summary().total_input_sat < MIN_EXPECTED_ECONOMIC_TOTAL_SAT {
             self.phase = Phase::AwaitingOwner { pending };
             return Err(ServiceError::BalanceBelowExpected);
@@ -429,16 +521,27 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
             self.phase = Phase::AwaitingOwner { pending };
             return Err(ServiceError::SummaryChanged);
         }
-        let written_at = unix_secs();
+        let written_at = recovery.map_or_else(unix_secs, |marker| marker.written_at_unix);
         let marker = MarkerFile {
             txid: prepared_summary.txid.clone(),
             destination: prepared_dest.clone(),
             fee_rate_sat_vb: prepared_rate,
             written_at_unix: written_at,
             outcome: "pending".to_string(),
+            original_inputs: Some(
+                claim
+                    .selected_outpoints()
+                    .iter()
+                    .map(|outpoint| MarkerInput {
+                        txid: outpoint.txid.to_string(),
+                        vout: outpoint.vout,
+                    })
+                    .collect(),
+            ),
         };
         // Both file and containing directory must be durable before the first outbound byte.
         write_marker_with_sync(&self.marker_path, &marker, self.directory_sync)?;
+        self.pending_marker = Some(marker.clone());
         self.submitted_destination = Some(prepared_dest);
         match self.submitter.submit(&claim) {
             Ok(receipt) => {
@@ -450,7 +553,7 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
                 Ok(receipt)
             }
             Err(SubmitError::Rejected(_)) if !resubmitting => {
-                match self.submitter.status(&prepared_summary.txid) {
+                match self.query_status(&prepared_summary.txid) {
                     Ok(TxStatus::Pending) => {
                         self.phase = Phase::Submitted {
                             txid: prepared_summary.txid.clone(),
@@ -488,6 +591,7 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
                             reason: "submission_rejected".to_string(),
                             pending: None,
                         };
+                        self.pending_marker = None;
                         Err(ServiceError::SubmissionRejected)
                     }
                     Err(_) => {
@@ -540,8 +644,9 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
             } => (txid.clone(), *submitted_at_unix, 0, false, true),
             _ => return,
         };
-        match self.submitter.status(&txid) {
+        match self.query_status(&txid) {
             Ok(TxStatus::Confirmed { block_height }) => {
+                self.recovery_not_found_polls = 0;
                 self.phase = Phase::Confirmed {
                     txid,
                     block_height,
@@ -549,6 +654,7 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
                 }
             }
             Ok(TxStatus::Pending) => {
+                self.recovery_not_found_polls = 0;
                 self.phase = Phase::Submitted {
                     txid,
                     submitted_at_unix: submitted_at,
@@ -570,13 +676,28 @@ impl<U: UtxoSource, S: Submitter, K: KeySource> ClaimService<U, S, K> {
                     }
                 };
             }
-            Ok(TxStatus::NotFound) | Err(_) => {}
+            // Absence is not a change to an explicitly revalidated retry preview.
+            // Keep it usable even after arbitrarily many further negative polls.
+            Ok(TxStatus::NotFound) if matches!(self.phase, Phase::Prepared { .. }) => {}
+            Ok(TxStatus::NotFound) => {
+                self.recovery_not_found_polls = self.recovery_not_found_polls.saturating_add(1);
+                if self.recovery_not_found_polls >= MAX_NOT_FOUND_POLLS {
+                    self.phase = Phase::Failed {
+                        reason: "submission_not_found".to_string(),
+                        pending: Some((txid, submitted_at)),
+                    };
+                }
+            }
+            Err(_) => {}
         }
     }
 }
 
 pub trait ClaimOps: Send {
     fn state(&self) -> ClaimState;
+    fn status_details(&self) -> ClaimStatusDetails {
+        ClaimStatusDetails::default()
+    }
     fn on_verified_hit(&mut self);
     fn prepare(&mut self, destination: &str) -> Result<ClaimSummary, ServiceError>;
     fn confirm(
@@ -591,6 +712,9 @@ impl<U: UtxoSource + Send, S: Submitter + Send, K: KeySource + Send> ClaimOps
 {
     fn state(&self) -> ClaimState {
         self.state()
+    }
+    fn status_details(&self) -> ClaimStatusDetails {
+        self.status_details()
     }
     fn on_verified_hit(&mut self) {
         self.on_verified_hit();
@@ -608,6 +732,38 @@ impl<U: UtxoSource + Send, S: Submitter + Send, K: KeySource + Send> ClaimOps
     fn poll(&mut self) {
         self.poll();
     }
+}
+
+fn retry_prevouts(
+    marker: Option<&MarkerFile>,
+    current: &[crate::claim::prevout::VerifiedPrevout],
+) -> Result<Vec<crate::claim::prevout::VerifiedPrevout>, ServiceError> {
+    let Some(inputs) = marker.and_then(|marker| marker.original_inputs.as_ref()) else {
+        // Legacy markers retain their TXID guard; only an identical rebuild can be sent.
+        return Ok(current.to_vec());
+    };
+    let mut expected = BTreeSet::new();
+    for input in inputs {
+        let outpoint = OutPoint {
+            txid: input.txid.parse().map_err(|_| ServiceError::Storage)?,
+            vout: input.vout,
+        };
+        if !expected.insert(outpoint) {
+            return Err(ServiceError::Storage);
+        }
+    }
+    if expected.is_empty() {
+        return Err(ServiceError::Storage);
+    }
+    let selected: Vec<_> = current
+        .iter()
+        .filter(|prevout| expected.contains(&prevout.outpoint()))
+        .cloned()
+        .collect();
+    if selected.len() != expected.len() {
+        return Err(ServiceError::SummaryChanged);
+    }
+    Ok(selected)
 }
 
 fn unix_secs() -> u64 {
@@ -905,6 +1061,7 @@ mod tests {
             fee_rate_sat_vb: DEFAULT_FEE_RATE_SAT_VB,
             written_at_unix: 1,
             outcome: outcome.to_string(),
+            original_inputs: None,
         };
         write_marker(path, &marker).expect("write test marker");
     }
@@ -1099,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn new_with_pending_marker_is_submitted_and_blocks_prepare_and_hit() {
+    fn new_with_pending_marker_is_unknown_and_blocks_a_different_transaction() {
         let dir = temp_dir();
         let marker_path = dir.join("marker.json");
         let txid = "ee".repeat(32);
@@ -1112,16 +1269,16 @@ mod tests {
             },
             _tmp: dir,
         };
-        assert!(matches!(
-            service.state(),
-            ClaimState::Submitted { txid: t, .. } if t == txid
-        ));
-        assert_eq!(
-            service.prepare(DEST).unwrap_err(),
-            ServiceError::InvalidState
+        assert!(
+            matches!(service.state(), ClaimState::Failed { reason } if reason == "submission_unknown")
         );
+        let preview = service.prepare(DEST).unwrap();
         service.on_verified_hit();
-        assert!(matches!(service.state(), ClaimState::Submitted { .. }));
+        assert_eq!(
+            service.confirm(DEST, &preview.txid),
+            Err(ServiceError::AlreadySubmittedDifferent { txid })
+        );
+        assert_eq!(service.submitter.submit_count.get(), 0);
     }
 
     #[test]
@@ -1408,13 +1565,14 @@ mod tests {
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
-        service.prepare(DEST).expect("prepare B");
+        let original = service.prepare(DEST).expect("prepare original");
+        assert_eq!(original.txid, txid_a);
         let preview_txid = prepared_txid(&service);
-        let err = service.confirm(DEST, &preview_txid).expect_err("B blocked");
-        assert!(matches!(
-            err,
-            ServiceError::AlreadySubmittedDifferent { txid } if txid == txid_a
-        ));
+        let err = service
+            .confirm(DEST, &"bb".repeat(32))
+            .expect_err("different preview blocked");
+        assert_eq!(err, ServiceError::PreparedTxidMismatch);
+        assert_eq!(preview_txid, txid_a);
         assert_eq!(service.submitter.submit_count.get(), 2);
     }
 
@@ -1515,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_confirms_pending_after_txid_summary_change() {
+    fn poll_confirms_pending_after_an_original_input_disappears() {
         let mut service = harness();
         service.on_verified_hit();
         let summary = service.prepare(DEST).unwrap();
@@ -1525,9 +1683,7 @@ mod tests {
         service.confirm(DEST, &preview_txid).expect_err("ambiguous");
         service.submitter.mode.set(SubmitMode::Success);
         service.prepare(DEST).expect("prepare");
-        let extra =
-            test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
-        service.utxo.prevouts.borrow_mut().push(extra);
+        service.utxo.prevouts.borrow_mut().clear();
         let preview_txid = prepared_txid(&service);
         let err = service.confirm(DEST, &preview_txid).expect_err("changed");
         assert_eq!(err, ServiceError::SummaryChanged);
@@ -1728,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_pending_blocks_a_different_txid_when_the_marker_file_is_gone() {
+    fn memory_pending_recovers_original_inputs_when_the_marker_file_is_gone() {
         let mut service = harness();
         service.on_verified_hit();
         let summary_a = service.prepare(DEST).unwrap();
@@ -1742,13 +1898,14 @@ mod tests {
         let extra =
             test_support::funded_prevout(test_support::derive_hash160(TEST_SCALAR), 7_100_000);
         service.utxo.prevouts.borrow_mut().push(extra);
-        service.prepare(DEST).expect("prepare B");
+        let original = service.prepare(DEST).expect("prepare original");
+        assert_eq!(original.txid, txid_a);
         let preview_txid = prepared_txid(&service);
-        let err = service.confirm(DEST, &preview_txid).expect_err("B blocked");
-        assert!(matches!(
-            err,
-            ServiceError::AlreadySubmittedDifferent { txid } if txid == txid_a
-        ));
+        let err = service
+            .confirm(DEST, &"bb".repeat(32))
+            .expect_err("different preview blocked");
+        assert_eq!(err, ServiceError::PreparedTxidMismatch);
+        assert_eq!(preview_txid, txid_a);
         assert_eq!(service.submitter.submit_count.get(), 1);
     }
 
@@ -1771,6 +1928,57 @@ mod tests {
         let scan = find_verified_found_key(&dir, hash, 0..=u128::MAX);
         assert_eq!(scan.found, None);
         assert!(scan.unloadable.is_empty());
+    }
+
+    #[test]
+    fn verified_key_scan_exposes_original_record_time_without_using_mtime() {
+        let dir = temp_dir();
+        let path = dir.join("FOUND_KEY.txt");
+        write_found_key(&path, 0o600, TEST_SCALAR);
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "TIMESTAMP (UNIX): 42"
+        )
+        .unwrap();
+        let modified_unix = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_ne!(
+            modified_unix, 42,
+            "fixture mtime must differ from record time"
+        );
+        let scan = find_verified_found_key(
+            &dir,
+            test_support::derive_hash160(TEST_SCALAR),
+            0..=u128::MAX,
+        );
+        assert_eq!(scan.found, Some(path));
+        assert_eq!(scan.timestamp_unix, Some(42));
+    }
+
+    #[test]
+    fn ambiguous_record_time_keeps_a_verified_key_available_with_unknown_time() {
+        let dir = temp_dir();
+        let path = dir.join("FOUND_KEY.txt");
+        write_found_key(&path, 0o600, TEST_SCALAR);
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "TIMESTAMP (UNIX): 42\nTIMESTAMP (UNIX): 43"
+        )
+        .unwrap();
+        let scan = find_verified_found_key(
+            &dir,
+            test_support::derive_hash160(TEST_SCALAR),
+            0..=u128::MAX,
+        );
+        assert_eq!(scan.found, Some(path));
+        assert_eq!(scan.timestamp_unix, None);
     }
 
     #[test]
@@ -1965,5 +2173,225 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn wallet_pre_send_sync_failure() -> Harness {
+        fn fail_sync(_: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "injected pre-send directory sync failure",
+            ))
+        }
+        let mut initial = harness();
+        initial.on_verified_hit();
+        let a = initial.prepare(DEST).unwrap();
+        initial.directory_sync = fail_sync;
+        assert_eq!(initial.confirm(DEST, &a.txid), Err(ServiceError::Storage));
+        assert_eq!(initial.submitter.submit_count.get(), 0);
+        initial
+    }
+
+    #[test]
+    fn wallet_restart_pre_send_marker_is_not_submission_evidence() {
+        let initial = wallet_pre_send_sync_failure();
+        let restarted = service_at(initial.marker_path.clone());
+        assert!(
+            matches!(restarted.state(), ClaimState::Failed { reason } if reason == "submission_unknown")
+        );
+        assert_eq!(restarted.submitter.submit_count.get(), 0);
+    }
+
+    #[test]
+    fn wallet_restart_pre_send_marker_cannot_return_duplicate_receipt() {
+        let initial = wallet_pre_send_sync_failure();
+        let txid = expect_marker(&initial.marker_path).txid;
+        let mut restarted = service_at(initial.marker_path.clone());
+        assert_eq!(
+            restarted.confirm(DEST, &txid),
+            Err(ServiceError::NotPrepared)
+        );
+        assert_eq!(restarted.submitter.submit_count.get(), 0);
+    }
+
+    #[test]
+    fn wallet_restart_original_retry_ignores_new_economic_input() {
+        let mut initial = harness();
+        initial.on_verified_hit();
+        let a = initial.prepare(DEST).unwrap();
+        initial.submitter.mode.set(SubmitMode::Ambiguous);
+        assert_eq!(
+            initial.confirm(DEST, &a.txid),
+            Err(ServiceError::SubmissionUnknown)
+        );
+        let mut restarted = service_at(initial.marker_path.clone());
+        restarted.submitter.status.set(TxStatus::NotFound);
+        restarted
+            .utxo
+            .prevouts
+            .borrow_mut()
+            .push(test_support::funded_prevout(
+                test_support::derive_hash160(TEST_SCALAR),
+                296_001,
+            ));
+        restarted.poll();
+        let original = restarted.prepare(DEST).unwrap();
+        assert_eq!(original.txid, a.txid);
+        assert_eq!(original.output_sat, a.output_sat);
+        assert_eq!(original.input_count, 1);
+        assert_eq!(restarted.submitter.submit_count.get(), 0);
+        assert_eq!(
+            restarted.confirm(DEST, &original.txid).unwrap().txid,
+            a.txid
+        );
+        assert_eq!(restarted.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn wallet_retry_missing_original_input_retains_guard() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let a = service.prepare(DEST).unwrap();
+        service.submitter.mode.set(SubmitMode::Ambiguous);
+        service.confirm(DEST, &a.txid).unwrap_err();
+        service.utxo.prevouts.borrow_mut().clear();
+        service
+            .utxo
+            .prevouts
+            .borrow_mut()
+            .push(test_support::funded_prevout(
+                test_support::derive_hash160(TEST_SCALAR),
+                711_000_000,
+            ));
+        assert_eq!(service.prepare(DEST), Err(ServiceError::SummaryChanged));
+        assert_eq!(expect_marker(&service.marker_path).txid, a.txid);
+        assert_eq!(expect_marker(&service.marker_path).outcome, "pending");
+        assert_eq!(service.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn wallet_retry_higher_fee_or_other_destination_retains_original() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let a = service.prepare(DEST).unwrap();
+        service.submitter.mode.set(SubmitMode::Ambiguous);
+        service.confirm(DEST, &a.txid).unwrap_err();
+        assert_eq!(
+            service.prepare(DEST2),
+            Err(ServiceError::DestinationMismatch)
+        );
+        service.submitter.fee_floor.set(DEFAULT_FEE_RATE_SAT_VB + 1);
+        assert_eq!(service.prepare(DEST), Err(ServiceError::SummaryChanged));
+        let marker = expect_marker(&service.marker_path);
+        assert_eq!(marker.txid, a.txid);
+        assert_eq!(marker.outcome, "pending");
+        assert_eq!(marker.fee_rate_sat_vb, DEFAULT_FEE_RATE_SAT_VB);
+        assert_eq!(service.submitter.submit_count.get(), 1);
+    }
+
+    #[test]
+    fn wallet_status_freshness_preserves_confirmation_on_error_and_recovers() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let a = service.prepare(DEST).unwrap();
+        service.confirm(DEST, &a.txid).unwrap();
+        service.poll();
+        let confirmed = service.state();
+        assert!(matches!(confirmed, ClaimState::Confirmed { .. }));
+        let success = service.status_details();
+        assert!(!success.unavailable);
+        assert!(success.last_success_unix.is_some());
+        service.status_details.last_attempt_unix = Some(1);
+        service.status_details.last_success_unix = Some(2);
+        service.submitter.status_err.set(true);
+        service.poll();
+        let error = service.status_details();
+        assert_eq!(service.state(), confirmed);
+        assert!(error.unavailable);
+        assert_eq!(error.last_success_unix, Some(2));
+        assert!(error.last_attempt_unix > Some(1));
+        service.submitter.status_err.set(false);
+        service.submitter.status.set(TxStatus::Pending);
+        service.poll();
+        assert!(matches!(service.state(), ClaimState::Submitted { txid, .. } if txid == a.txid));
+        let recovered = service.status_details();
+        assert!(!recovered.unavailable);
+        assert_eq!(recovered.pending_txid, Some(a.txid));
+        assert!(recovered.last_success_unix > Some(2));
+    }
+
+    #[test]
+    fn wallet_marker_contains_only_original_public_input_metadata() {
+        let mut service = harness();
+        service.on_verified_hit();
+        let a = service.prepare(DEST).unwrap();
+        service.submitter.mode.set(SubmitMode::Ambiguous);
+        service.confirm(DEST, &a.txid).unwrap_err();
+        let raw = fs::read_to_string(&service.marker_path).unwrap();
+        let marker: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let inputs = marker["original_inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].as_object().unwrap().len(), 2);
+        assert_eq!(inputs[0]["txid"].as_str().unwrap().len(), 64);
+        assert!(inputs[0]["vout"].is_u64());
+        for forbidden in ["private", "pubkey", "signature", "raw_tx", "tx_hex"] {
+            assert!(!raw.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn wallet_retry_changed_original_txid_stays_blocked() {
+        let mut initial = harness();
+        initial.on_verified_hit();
+        let a = initial.prepare(DEST).unwrap();
+        initial.submitter.mode.set(SubmitMode::Ambiguous);
+        initial.confirm(DEST, &a.txid).unwrap_err();
+        let mut marker = expect_marker(&initial.marker_path);
+        marker.txid = "ab".repeat(32);
+        write_marker(&initial.marker_path, &marker).unwrap();
+        let mut restarted = service_at(initial.marker_path.clone());
+        assert_eq!(restarted.prepare(DEST), Err(ServiceError::SummaryChanged));
+        assert_eq!(expect_marker(&restarted.marker_path).txid, marker.txid);
+        assert_eq!(restarted.submitter.submit_count.get(), 0);
+    }
+
+    #[test]
+    fn wallet_prepared_original_retry_survives_not_found_polls() {
+        let mut initial = harness();
+        initial.on_verified_hit();
+        let a = initial.prepare(DEST).unwrap();
+        initial.submitter.mode.set(SubmitMode::Ambiguous);
+        assert_eq!(
+            initial.confirm(DEST, &a.txid),
+            Err(ServiceError::SubmissionUnknown)
+        );
+        let mut restarted = service_at(initial.marker_path.clone());
+        restarted.submitter.status.set(TxStatus::NotFound);
+        for _ in 0..MAX_NOT_FOUND_POLLS {
+            restarted.poll();
+        }
+        assert!(
+            matches!(restarted.state(), ClaimState::Failed { reason } if reason == "submission_not_found")
+        );
+        let retry = restarted.prepare(DEST).unwrap();
+        assert_eq!(retry.txid, a.txid);
+        assert_eq!(retry.output_sat, a.output_sat);
+        for poll_number in 1..=MAX_NOT_FOUND_POLLS + 2 {
+            restarted.poll();
+            assert!(
+                matches!(restarted.state(), ClaimState::Prepared { summary } if summary.txid == a.txid),
+                "NotFound poll {poll_number} discarded the unchanged original retry preview"
+            );
+        }
+        assert_eq!(
+            restarted.confirm(DEST, &"bb".repeat(32)),
+            Err(ServiceError::PreparedTxidMismatch)
+        );
+        assert_eq!(
+            restarted.confirm(DEST2, &a.txid),
+            Err(ServiceError::DestinationMismatch)
+        );
+        assert_eq!(restarted.submitter.submit_count.get(), 0);
+        assert_eq!(expect_marker(&restarted.marker_path).txid, a.txid);
+        assert_eq!(restarted.confirm(DEST, &retry.txid).unwrap().txid, a.txid);
+        assert_eq!(restarted.submitter.submit_count.get(), 1);
     }
 }

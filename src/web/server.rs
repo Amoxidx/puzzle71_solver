@@ -4,10 +4,10 @@ use crate::claim::error::ClaimError;
 use crate::claim::net::error::NetError;
 use crate::claim::net::esplora::ClaimFetchError;
 use crate::claim::net::slipstream::SubmitReceipt;
-use crate::claim::service::{ClaimOps, ClaimState, ServiceError};
+use crate::claim::service::{ClaimOps, ClaimState, ClaimStatusDetails, ServiceError};
 use crate::claim::verify::ClaimSummary;
 use crate::crypto::cpu_engine::run_mini_puzzle_test;
-use crate::power::controller::PowerMode;
+use crate::power::controller::{MAX_GPU_DUTY_CYCLE, PowerMode};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,6 +32,22 @@ pub struct PublicHitStatus {
 }
 
 #[derive(Clone)]
+pub struct PublicClaimSnapshot {
+    pub claim: ClaimState,
+    pub details: ClaimStatusDetails,
+}
+
+impl PublicClaimSnapshot {
+    /// The caller holds the service lock so phase and provider health describe one instant.
+    pub fn from_service(service: &dyn ClaimOps) -> Self {
+        Self {
+            claim: service.state(),
+            details: service.status_details(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SharedSolverState {
     pub is_running: Arc<AtomicBool>,
     pub mode: Arc<Mutex<PowerMode>>,
@@ -47,14 +63,37 @@ pub struct SharedSolverState {
     pub last_gpu_active_ms: Arc<Mutex<f64>>,
     pub last_throttle_sleep_ms: Arc<Mutex<f64>>,
     pub checkpoint_saved_timestamp: Arc<AtomicU64>,
+    pub progress_available: Arc<AtomicBool>,
     pub hit: Arc<Mutex<Option<PublicHitStatus>>>,
     pub last_error: Arc<Mutex<Option<String>>>,
     pub claim: Arc<Mutex<Option<Box<dyn ClaimOps + Send>>>>,
-    pub claim_snapshot: Arc<Mutex<Option<ClaimState>>>,
+    pub claim_snapshot: Arc<Mutex<Option<PublicClaimSnapshot>>>,
     selftest_running: Arc<AtomicBool>,
 }
 
 impl SharedSolverState {
+    /// A requested profile is visible even while paused. Keep its initial duty paired with it.
+    pub fn request_mode(&self, mode: PowerMode) {
+        let mut requested = self.mode.lock().unwrap();
+        if *requested != mode {
+            *requested = mode;
+            *self.target_gpu_duty_pct.lock().unwrap() = mode.initial_duty_cycle() * 100.0;
+        }
+    }
+
+    /// A completed dispatch cannot overwrite a newer requested profile's displayed target.
+    pub fn publish_governor_duty(&self, applied_mode: PowerMode, duty: f32) {
+        let requested = self.mode.lock().unwrap();
+        if *requested == applied_mode {
+            *self.target_gpu_duty_pct.lock().unwrap() = duty.min(MAX_GPU_DUTY_CYCLE) * 100.0;
+        }
+    }
+
+    fn mode_and_duty(&self) -> (PowerMode, f32) {
+        let requested = self.mode.lock().unwrap();
+        (*requested, *self.target_gpu_duty_pct.lock().unwrap())
+    }
+
     pub fn new() -> Self {
         Self {
             is_running: Arc::new(AtomicBool::new(true)),
@@ -67,10 +106,11 @@ impl SharedSolverState {
             estimated_soc_temp_celsius: Arc::new(Mutex::new(0.0)),
             process_cpu_load_pct: Arc::new(Mutex::new(0.0)),
             runtime_secs: Arc::new(Mutex::new(0.0)),
-            target_gpu_duty_pct: Arc::new(Mutex::new(70.0)),
+            target_gpu_duty_pct: Arc::new(Mutex::new(PowerMode::Auto.initial_duty_cycle() * 100.0)),
             last_gpu_active_ms: Arc::new(Mutex::new(0.0)),
             last_throttle_sleep_ms: Arc::new(Mutex::new(0.0)),
             checkpoint_saved_timestamp: Arc::new(AtomicU64::new(0)),
+            progress_available: Arc::new(AtomicBool::new(false)),
             hit: Arc::new(Mutex::new(None)),
             last_error: Arc::new(Mutex::new(None)),
             claim: Arc::new(Mutex::new(None)),
@@ -102,9 +142,11 @@ struct StatusResponse {
     last_gpu_active_ms: f64,
     last_throttle_sleep_ms: f64,
     checkpoint_saved_timestamp: u64,
+    progress_available: bool,
     hit: Option<PublicHitStatus>,
     last_error: Option<String>,
     claim: Option<ClaimState>,
+    claim_status_details: Option<ClaimStatusDetails>,
     claim_busy: bool,
 }
 
@@ -175,6 +217,9 @@ pub fn start_web_server(host: &str, port: u16, state: SharedSolverState) -> Resu
             "Refusing non-loopback dashboard bind '{}'; use 127.0.0.1",
             host
         ));
+    }
+    if port == 0 {
+        return Err("Dashboard port must be from 1 to 65535".to_string());
     }
 
     let bind_addr = format!("{}:{}", host, port);
@@ -308,10 +353,15 @@ fn handle_client(stream: &mut TcpStream, state: &SharedSolverState, port: u16) {
             );
         }
         ("GET", "/api/status") => {
-            let (claim, claim_busy) = current_claim_state(state);
+            let (snapshot, claim_busy) = current_claim_snapshot(state);
+            let (claim, claim_status_details) = match snapshot {
+                Some(snapshot) => (Some(snapshot.claim), Some(snapshot.details)),
+                None => (None, None),
+            };
+            let (mode, duty) = state.mode_and_duty();
             let status = StatusResponse {
                 is_running: state.is_running.load(Ordering::SeqCst),
-                mode: state.mode.lock().unwrap().name().to_string(),
+                mode: mode.name().to_string(),
                 total_keys_tested: state.total_keys_tested.lock().unwrap().to_string(),
                 total_blocks_tested: state.total_blocks_tested.load(Ordering::SeqCst),
                 current_keys_per_sec: *state.current_keys_per_sec.lock().unwrap(),
@@ -320,13 +370,15 @@ fn handle_client(stream: &mut TcpStream, state: &SharedSolverState, port: u16) {
                 estimated_soc_temp_celsius: *state.estimated_soc_temp_celsius.lock().unwrap(),
                 process_cpu_load_pct: *state.process_cpu_load_pct.lock().unwrap(),
                 runtime_secs: *state.runtime_secs.lock().unwrap(),
-                target_gpu_duty_pct: *state.target_gpu_duty_pct.lock().unwrap(),
+                target_gpu_duty_pct: duty,
                 last_gpu_active_ms: *state.last_gpu_active_ms.lock().unwrap(),
                 last_throttle_sleep_ms: *state.last_throttle_sleep_ms.lock().unwrap(),
                 checkpoint_saved_timestamp: state.checkpoint_saved_timestamp.load(Ordering::SeqCst),
+                progress_available: state.progress_available.load(Ordering::SeqCst),
                 hit: state.hit.lock().unwrap().clone(),
                 last_error: state.last_error.lock().unwrap().clone(),
                 claim,
+                claim_status_details,
                 claim_busy,
             };
             send_json(stream, "200 OK", &status);
@@ -373,7 +425,7 @@ fn handle_client(stream: &mut TcpStream, state: &SharedSolverState, port: u16) {
                 .and_then(|request| request.mode.parse::<PowerMode>().ok());
 
             if let Some(mode) = parsed_mode {
-                *state.mode.lock().unwrap() = mode;
+                state.request_mode(mode);
                 send_json(
                     stream,
                     "200 OK",
@@ -558,21 +610,31 @@ fn host_is_allowed(request: &str, port: u16) -> bool {
     let Some(host) = http_header(request, "Host") else {
         return false;
     };
-    host == format!("127.0.0.1:{port}")
+    authority_is_allowed(host, port)
+}
+
+fn authority_is_allowed(authority: &str, port: u16) -> bool {
+    authority == format!("127.0.0.1:{port}") || (port == 80 && authority == "127.0.0.1")
+}
+
+fn loopback_origin_is_allowed(origin: &str, port: u16) -> bool {
+    origin
+        .strip_prefix("http://")
+        .is_some_and(|authority| authority_is_allowed(authority, port))
 }
 
 fn claim_request_allowed(request: &str, port: u16) -> ClaimRequestDecision {
     let Some(origin) = http_header(request, "origin") else {
         return ClaimRequestDecision::Forbidden;
     };
-    if origin != format!("http://127.0.0.1:{port}") {
+    if !loopback_origin_is_allowed(origin, port) {
         return ClaimRequestDecision::Forbidden;
     }
 
     let Some(host) = http_header(request, "host") else {
         return ClaimRequestDecision::Forbidden;
     };
-    if host != format!("127.0.0.1:{port}") {
+    if !authority_is_allowed(host, port) {
         return ClaimRequestDecision::Forbidden;
     }
 
@@ -589,17 +651,21 @@ fn request_body(request: &str) -> &str {
         .unwrap_or_default()
 }
 
-fn current_claim_state(state: &SharedSolverState) -> (Option<ClaimState>, bool) {
+fn current_claim_snapshot(state: &SharedSolverState) -> (Option<PublicClaimSnapshot>, bool) {
     match state.claim.try_lock() {
         Ok(guard) => {
-            let snap = guard.as_ref().map(|service| service.state());
+            let snap = guard
+                .as_ref()
+                .map(|service| PublicClaimSnapshot::from_service(service.as_ref()));
             *state.claim_snapshot.lock().unwrap() = snap.clone();
             (snap, false)
         }
         Err(TryLockError::WouldBlock) => (state.claim_snapshot.lock().unwrap().clone(), true),
         Err(TryLockError::Poisoned(poisoned)) => {
             let guard = poisoned.into_inner();
-            let snap = guard.as_ref().map(|service| service.state());
+            let snap = guard
+                .as_ref()
+                .map(|service| PublicClaimSnapshot::from_service(service.as_ref()));
             *state.claim_snapshot.lock().unwrap() = snap.clone();
             (snap, false)
         }
@@ -628,7 +694,8 @@ where
         return Err(ClaimHandlerError::NoClaim);
     };
     let result = op(service.as_mut());
-    *state.claim_snapshot.lock().unwrap() = Some(service.state());
+    *state.claim_snapshot.lock().unwrap() =
+        Some(PublicClaimSnapshot::from_service(service.as_ref()));
     result.map_err(ClaimHandlerError::Service)
 }
 
@@ -754,7 +821,7 @@ fn origin_is_allowed(request: &str, port: u16) -> bool {
         return true;
     };
 
-    origin == format!("http://127.0.0.1:{}", port)
+    loopback_origin_is_allowed(origin, port)
 }
 
 fn send_json<T: Serialize>(stream: &mut TcpStream, status: &str, value: &T) {
@@ -1773,5 +1840,160 @@ mod tests {
             .found
             .expect("valid");
         assert_eq!(found.file_name().unwrap(), "FOUND_KEY.txt");
+    }
+
+    #[test]
+    fn default_http_port_accepts_the_browser_host_without_an_explicit_port() {
+        assert!(host_is_allowed(&host_request("Host: 127.0.0.1"), 80));
+        assert!(host_is_allowed(&host_request("Host: 127.0.0.1:80"), 80));
+        assert!(!host_is_allowed(&host_request("Host: 127.0.0.1"), 8080));
+        assert!(!host_is_allowed(&host_request("Host: 127.0.0.1.evil"), 80));
+    }
+
+    #[test]
+    fn default_http_port_accepts_the_canonical_browser_origin_for_controls() {
+        let request = "POST /api/stop HTTP/1.1\r\nOrigin: http://127.0.0.1\r\n\r\n";
+        assert!(origin_is_allowed(request, 80));
+        assert!(!origin_is_allowed(request, 8080));
+        assert!(!origin_is_allowed(
+            "POST /api/stop HTTP/1.1\r\nOrigin: http://127.0.0.1.evil\r\n\r\n",
+            80
+        ));
+    }
+
+    #[test]
+    fn default_http_port_accepts_canonical_claim_headers() {
+        let request = claim_headers("http://127.0.0.1", "127.0.0.1", "application/json");
+        assert_eq!(
+            claim_request_allowed(&request, 80),
+            ClaimRequestDecision::Allowed
+        );
+        assert_eq!(
+            claim_request_allowed(&request, 8080),
+            ClaimRequestDecision::Forbidden
+        );
+    }
+
+    fn assert_paused_mode_target(mode: &str, expected: f64) {
+        let state = SharedSolverState::new();
+        state.is_running.store(false, Ordering::SeqCst);
+        *state.mode.lock().unwrap() = PowerMode::Balanced;
+        *state.target_gpu_duty_pct.lock().unwrap() = 70.0;
+        let response = exchange_claim_http(state.clone(), |port| {
+            claim_post_http(
+                "/api/mode",
+                Some(format!("http://127.0.0.1:{port}")),
+                Some(format!("127.0.0.1:{port}")),
+                "application/json",
+                &format!("{{\"mode\":\"{mode}\"}}"),
+            )
+        });
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let status = get_status_json(state);
+        assert_eq!(status["is_running"], false);
+        assert_eq!(status["mode"], mode.to_uppercase());
+        assert!((status["target_gpu_duty_pct"].as_f64().unwrap() - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn paused_full_request_publishes_ninety_percent_without_dispatching() {
+        assert_paused_mode_target("full", 90.0);
+    }
+
+    #[test]
+    fn paused_eco_request_publishes_forty_percent_without_dispatching() {
+        assert_paused_mode_target("eco", 40.0);
+    }
+
+    #[test]
+    fn paused_high_request_publishes_eighty_five_percent_without_dispatching() {
+        assert_paused_mode_target("high", 85.0);
+    }
+
+    #[test]
+    fn late_governor_sample_cannot_overwrite_a_newer_requested_mode() {
+        let state = SharedSolverState::new();
+        state.request_mode(PowerMode::Balanced);
+        state.publish_governor_duty(PowerMode::Balanced, 0.70);
+        state.request_mode(PowerMode::Eco);
+        state.publish_governor_duty(PowerMode::Balanced, 0.70);
+        let status = get_status_json(state);
+        assert_eq!(status["mode"], "ECO");
+        assert_eq!(status["target_gpu_duty_pct"], 40.0);
+    }
+
+    #[test]
+    fn selecting_the_same_auto_profile_preserves_its_adapted_target() {
+        let state = SharedSolverState::new();
+        state.publish_governor_duty(PowerMode::Auto, 0.42);
+        state.request_mode(PowerMode::Auto);
+        let status = get_status_json(state);
+        assert!((status["target_gpu_duty_pct"].as_f64().unwrap() - 42.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn recovered_service_without_loaded_search_history_marks_it_unavailable() {
+        let state = SharedSolverState::new();
+        seed_hit(&state);
+        let status = get_status_json(state);
+        assert_eq!(status["progress_available"], false);
+    }
+
+    #[test]
+    fn loaded_search_history_is_explicitly_available() {
+        let state = SharedSolverState::new();
+        state.progress_available.store(true, Ordering::SeqCst);
+        let status = get_status_json(state);
+        assert_eq!(status["progress_available"], true);
+    }
+
+    #[test]
+    fn status_health_and_busy_fallback_keep_the_same_public_snapshot() {
+        struct HealthClaim;
+        impl ClaimOps for HealthClaim {
+            fn state(&self) -> ClaimState {
+                ClaimState::Confirmed {
+                    txid: "aa".repeat(32),
+                    block_height: 42,
+                }
+            }
+            fn status_details(&self) -> ClaimStatusDetails {
+                ClaimStatusDetails {
+                    pending_txid: None,
+                    last_success_unix: Some(10),
+                    last_attempt_unix: Some(20),
+                    unavailable: true,
+                }
+            }
+            fn on_verified_hit(&mut self) {}
+            fn prepare(&mut self, _: &str) -> Result<ClaimSummary, ServiceError> {
+                Err(ServiceError::InvalidState)
+            }
+            fn confirm(&mut self, _: &str, _: &str) -> Result<SubmitReceipt, ServiceError> {
+                Err(ServiceError::InvalidState)
+            }
+            fn poll(&mut self) {}
+        }
+        let state = SharedSolverState::new();
+        *state.claim.lock().unwrap() = Some(Box::new(HealthClaim));
+        let first = get_status_json(state.clone());
+        assert_eq!(first["claim"]["Confirmed"]["block_height"], 42);
+        assert_eq!(first["claim_status_details"]["unavailable"], true);
+        assert_eq!(first["claim_status_details"]["last_success_unix"], 10);
+        let holder = state.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = thread::spawn(move || {
+            let _guard = holder.claim.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let busy = get_status_json(state);
+        drop(release_tx);
+        held.join().unwrap();
+        assert_eq!(busy["claim_busy"], true);
+        assert_eq!(busy["claim"], first["claim"]);
+        assert_eq!(busy["claim_status_details"], first["claim_status_details"]);
     }
 }

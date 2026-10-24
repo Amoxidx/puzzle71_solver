@@ -401,7 +401,7 @@ fn claims_economic_utxos_to_a_bech32m_p2tr_destination() {
 
 #[test]
 #[ignore = "needs bitcoind regtest, run scripts/regtest-up.sh"]
-fn refuses_to_build_and_therefore_never_sends_when_a_prevout_is_tampered() {
+fn rejects_tampered_funding_bytes_and_builds_the_untampered_control() {
     let (puzzle_address, puzzle_script, key) = setup(0x82A7F5);
 
     let scanned = scan_utxos(&puzzle_address);

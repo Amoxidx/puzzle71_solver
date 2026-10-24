@@ -8,131 +8,71 @@ use puzzle71_solver::claim::{
     ClaimService, CurlTransport, EsploraUtxoSource, FoundKeyFile, SlipstreamSubmitter,
     TelegramNotifier, find_verified_found_key,
 };
+use puzzle71_solver::cli::{CliAction, CliOptions};
 use puzzle71_solver::crypto::cpu_engine::run_mini_puzzle_test;
 use puzzle71_solver::hit_handler::{
     FOUND_KEY_FILENAME, VerifiedHit, recover_staged_hit, verify_candidate,
 };
 use puzzle71_solver::metal_engine::metal_solver::MetalSolver;
-use puzzle71_solver::power::controller::{PowerGovernor, PowerMode};
-use puzzle71_solver::puzzle_config::{
-    RANGE_MAX, RANGE_MIN, RANGE_SIZE, TARGET_ADDRESS, TARGET_HASH160,
-};
+use puzzle71_solver::power::controller::PowerGovernor;
+use puzzle71_solver::puzzle_config::{RANGE_MAX, RANGE_MIN, TARGET_ADDRESS, TARGET_HASH160};
 use puzzle71_solver::search::block_progress::BlockProgress;
 use puzzle71_solver::search::checkpoint::DEFAULT_CHECKPOINT_FILE;
 use puzzle71_solver::search::profile::dispatch_profile;
 use puzzle71_solver::search::rng::select_random_block_start;
 use puzzle71_solver::search::store::{CheckpointLock, CheckpointStore};
 use puzzle71_solver::ui::terminal::SolverStats;
-use puzzle71_solver::web::server::{PublicHitStatus, SharedSolverState, start_web_server};
+use puzzle71_solver::web::server::{
+    PublicClaimSnapshot, PublicHitStatus, SharedSolverState, start_web_server,
+};
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    // Default configuration
-    let mut mode = PowerMode::Auto;
-    let mut electricity_price = 0.34; // EUR/kWh
-    let mut block_size: u128 = 16_777_216; // 2^24 keys per block (~16.7M keys)
-    let mut web_host = "127.0.0.1".to_string();
-    let mut web_port: u16 = 8080;
-    let mut enable_tui = true;
-
-    // Parse CLI options
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--bench" | "benchmark" => {
-                if let Err(error) = run_comprehensive_benchmark(electricity_price) {
-                    eprintln!("Benchmark failed: {error}");
-                    std::process::exit(1);
-                }
-                return;
-            }
-            "--test-mini" => {
-                run_self_test();
-                return;
-            }
-            "--telegram-test" => {
-                let notifier = TelegramNotifier::new(CurlTransport, telegram_config_path());
-                match notifier.send_test_alert() {
-                    Ok(()) => {
-                        println!("Telegram-Test gesendet");
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("Telegram-Test fehlgeschlagen: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "--mode" => {
-                if i + 1 < args.len() {
-                    mode = args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!(
-                            "Invalid mode '{}'. Options: eco, balanced, high, full, auto",
-                            args[i + 1]
-                        );
-                        std::process::exit(1);
-                    });
-                    i += 1;
-                }
-            }
-            "--host" => {
-                if i + 1 < args.len() {
-                    web_host = args[i + 1].clone();
-                    i += 1;
-                }
-            }
-            "--port" => {
-                if i + 1 < args.len() {
-                    web_port = args[i + 1].parse().unwrap_or(8080);
-                    i += 1;
-                }
-            }
-            "--no-tui" => {
-                enable_tui = false;
-            }
-            "--electricity-price" => {
-                if i + 1 < args.len() {
-                    electricity_price = args[i + 1].parse().unwrap_or(0.34);
-                    i += 1;
-                }
-            }
-            "--block-size" => {
-                if i + 1 < args.len() {
-                    block_size = args[i + 1].parse().unwrap_or(16_777_216);
-                    i += 1;
-                }
-            }
-            "--help" | "-h" => {
-                print_help();
-                return;
-            }
-            other => {
-                eprintln!("Unknown argument: {}", other);
-                print_help();
+    let CliOptions {
+        mode,
+        electricity_price,
+        block_size,
+        web_host,
+        web_port,
+        enable_tui,
+        action,
+    } = CliOptions::parse(env::args().skip(1)).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    match action {
+        CliAction::Search => {}
+        CliAction::Help => {
+            print_help();
+            return;
+        }
+        CliAction::Benchmark => {
+            if let Err(error) = run_comprehensive_benchmark(electricity_price) {
+                eprintln!("Benchmark failed: {error}");
                 std::process::exit(1);
             }
+            return;
         }
-        i += 1;
-    }
-
-    let block_count_fits_index = block_size > 0 && RANGE_SIZE / block_size <= u64::MAX as u128;
-    if block_size == 0
-        || block_size > RANGE_SIZE
-        || !RANGE_SIZE.is_multiple_of(block_size)
-        || !block_count_fits_index
-    {
-        eprintln!(
-            "Invalid block size {}. It must divide 2^70 exactly and produce at most 2^64-1 blocks.",
-            block_size
-        );
-        std::process::exit(1);
+        CliAction::SelfTest => {
+            run_self_test();
+            return;
+        }
+        CliAction::TelegramTest => {
+            let notifier = TelegramNotifier::new(CurlTransport, telegram_config_path());
+            match notifier.send_test_alert() {
+                Ok(()) => println!("Telegram-Test gesendet"),
+                Err(error) => {
+                    eprintln!("Telegram-Test fehlgeschlagen: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
     }
 
     // Step 1: Execute mandatory CPU cryptographic and 24-bit Mini-Puzzle test
@@ -144,7 +84,6 @@ fn main() {
         libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
         libc::signal(libc::SIGTERM, handle_sigint as *const () as usize);
     }
-    SHUTDOWN_SIGNAL.store(false, Ordering::SeqCst);
 
     // Protect search progress and recovered claims before either path can write.
     let checkpoint_lock =
@@ -156,7 +95,12 @@ fn main() {
     let found_key_scan =
         find_verified_found_key(Path::new("."), TARGET_HASH160, RANGE_MIN..=RANGE_MAX);
     if let Some(found_path) = found_key_scan.found {
-        resume_from_found_key(&web_host, web_port, found_path);
+        resume_from_found_key(
+            &web_host,
+            web_port,
+            found_path,
+            found_key_scan.timestamp_unix,
+        );
         return;
     }
     if !found_key_scan.unloadable.is_empty() {
@@ -193,7 +137,8 @@ fn main() {
 
     // Step 4: Setup shared state & launch Localhost Web Dashboard Server
     let shared_state = SharedSolverState::new();
-    *shared_state.mode.lock().unwrap() = mode;
+    shared_state.request_mode(mode);
+    *shared_state.runtime_secs.lock().unwrap() = checkpoint.total_runtime_secs();
     *shared_state.total_keys_tested.lock().unwrap() = checkpoint.total_keys_tested();
     shared_state
         .total_blocks_tested
@@ -201,6 +146,9 @@ fn main() {
     shared_state
         .checkpoint_saved_timestamp
         .store(checkpoint.last_saved_timestamp(), Ordering::SeqCst);
+    shared_state
+        .progress_available
+        .store(true, Ordering::SeqCst);
 
     start_web_server(&web_host, web_port, shared_state.clone()).unwrap_or_else(|e| {
         eprintln!(
@@ -216,7 +164,7 @@ fn main() {
         .self_test()
         .expect("Independent GPU self-test failed; refusing to search");
     let mut governor = PowerGovernor::new(mode);
-    *shared_state.target_gpu_duty_pct.lock().unwrap() = governor.target_duty_cycle() * 100.0;
+    shared_state.publish_governor_duty(mode, governor.target_duty_cycle());
 
     let mut total_keys_session = 0u128;
     let mut active_runtime_session = Duration::ZERO;
@@ -391,8 +339,8 @@ fn main() {
                     *shared_state.process_cpu_load_pct.lock().unwrap() = metrics.cpu_load_pct;
                     *shared_state.runtime_secs.lock().unwrap() =
                         runtime_before_session + active_runtime_session.as_secs_f64();
-                    *shared_state.target_gpu_duty_pct.lock().unwrap() =
-                        governor.target_duty_cycle() * 100.0;
+                    shared_state
+                        .publish_governor_duty(requested_mode, governor.target_duty_cycle());
                     *shared_state.last_gpu_active_ms.lock().unwrap() =
                         outcome.gpu_duration.as_secs_f64() * 1000.0;
                     *shared_state.last_throttle_sleep_ms.lock().unwrap() =
@@ -518,15 +466,15 @@ fn main() {
     }
 }
 
-fn resume_from_found_key(web_host: &str, web_port: u16, found_path: PathBuf) {
+fn resume_from_found_key(
+    web_host: &str,
+    web_port: u16,
+    found_path: PathBuf,
+    timestamp_unix: Option<u64>,
+) {
     let shared_state = SharedSolverState::new();
     shared_state.is_running.store(false, Ordering::SeqCst);
-    let timestamp_unix = std::fs::metadata(&found_path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+    let timestamp_unix = timestamp_unix.unwrap_or(0);
     let saved_filename = found_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -627,7 +575,8 @@ fn init_claim_service(shared_state: &SharedSolverState, found_key_path: PathBuf)
         let mut slot = shared_state.claim.lock().unwrap();
         *slot = Some(Box::new(service));
         if let Some(svc) = slot.as_ref() {
-            *shared_state.claim_snapshot.lock().unwrap() = Some(svc.state());
+            *shared_state.claim_snapshot.lock().unwrap() =
+                Some(PublicClaimSnapshot::from_service(svc.as_ref()));
         }
     }
     let claim = shared_state.claim.clone();
@@ -643,7 +592,7 @@ fn init_claim_service(shared_state: &SharedSolverState, found_key_path: PathBuf)
                 continue;
             };
             svc.poll();
-            *snapshot.lock().unwrap() = Some(svc.state());
+            *snapshot.lock().unwrap() = Some(PublicClaimSnapshot::from_service(svc.as_ref()));
         }
     });
 }

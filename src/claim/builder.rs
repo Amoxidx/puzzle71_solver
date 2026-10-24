@@ -12,6 +12,7 @@ use bitcoin::{
     absolute, consensus, ecdsa, script, transaction,
 };
 
+use crate::claim::destination::validate_destination_type;
 use crate::claim::error::ClaimError;
 use crate::claim::key::ClaimKey;
 use crate::claim::memory::secure_zero;
@@ -27,6 +28,7 @@ use crate::claim::verify::{ClaimSummary, verify_signed_claim};
 pub struct SignedClaim {
     raw: Vec<u8>,
     summary: ClaimSummary,
+    input_outpoints: Vec<bitcoin::OutPoint>,
 }
 
 impl fmt::Debug for SignedClaim {
@@ -47,6 +49,10 @@ impl SignedClaim {
         &self.summary
     }
 
+    pub(crate) fn selected_outpoints(&self) -> &[bitcoin::OutPoint] {
+        &self.input_outpoints
+    }
+
     /// Returns the raw, serialized signed transaction bytes.
     ///
     /// This is the only place these bytes are exposed. The serialized transaction contains the
@@ -60,10 +66,10 @@ impl SignedClaim {
     }
 }
 
-/// Builds a claim transaction spending the economic prevouts among `prevouts` to `destination`
-/// at `fee_rate_sat_vb`, signs every input with `key`, and independently re-verifies the result
-/// via [`verify_signed_claim`] before returning it. Non-economic ("dust") prevouts are excluded
-/// from the transaction and only counted in the returned summary.
+/// Builds the payout-optimal claim at the exact aggregate worst-case-size fee, signs every
+/// selected input with `key`, and independently re-verifies it before returning. Excluded
+/// prevouts, including marginal inputs which cannot jointly pay a CompactSize jump, are
+/// counted in the summary's existing excluded-input fields.
 pub fn build_signed_claim(
     key: &ClaimKey,
     prevouts: &[VerifiedPrevout],
@@ -88,15 +94,10 @@ pub fn build_signed_claim(
         }
     }
 
-    let mut economic: Vec<&VerifiedPrevout> = Vec::new();
-    for prevout in prevouts {
-        if policy::is_economic(prevout.txout().value.to_sat(), fee_rate_sat_vb) {
-            economic.push(prevout);
-        }
-    }
-    if economic.is_empty() {
-        return Err(ClaimError::NoEconomicInputs);
-    }
+    validate_destination_type(destination)?;
+    let mut economic =
+        policy::select_prevouts(prevouts, &destination.script_pubkey(), fee_rate_sat_vb)?;
+    policy::check_max_weight(economic.len() as u64, &destination.script_pubkey())?;
 
     // Deterministic input order: ascending by (txid bytes, vout), independent of the caller's
     // supplied order — required for `build_signed_claim` to be reproducible byte-for-byte.
@@ -174,7 +175,12 @@ pub fn build_signed_claim(
     let raw = consensus::serialize(&tx);
     let summary = verify_signed_claim(&raw, prevouts, destination, fee_rate_sat_vb)?;
 
-    Ok(SignedClaim { raw, summary })
+    let input_outpoints = economic.iter().map(|p| p.outpoint()).collect();
+    Ok(SignedClaim {
+        raw,
+        summary,
+        input_outpoints,
+    })
 }
 
 #[cfg(test)]
@@ -394,5 +400,167 @@ mod tests {
             s.push_str(&format!("{b:02x}"));
         }
         s
+    }
+    fn audit_regression_prevouts(small_count: usize, small_value: u64) -> Vec<VerifiedPrevout> {
+        let script = p2pkh_script_for_hash160(test_support::derive_hash160(TEST_SCALAR));
+        let mut outputs = vec![TxOut {
+            value: Amount::from_sat(710_000_000),
+            script_pubkey: script.clone(),
+        }];
+        outputs.extend((0..small_count).map(|_| TxOut {
+            value: Amount::from_sat(small_value),
+            script_pubkey: script.clone(),
+        }));
+        let funding = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x42; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: outputs,
+        };
+        let raw = consensus::serialize(&funding);
+        (0..funding.output.len())
+            .map(|vout| {
+                crate::claim::prevout::verify_prevout(
+                    bitcoin::OutPoint {
+                        txid: funding.compute_txid(),
+                        vout: vout as u32,
+                    },
+                    &raw,
+                    &script,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn audit_regression_extra_input_at_compactsize_boundary_does_not_reduce_payout() {
+        let key = test_support::test_claim_key();
+        let before = build_signed_claim(
+            &key,
+            &audit_regression_prevouts(251, 296_001),
+            &test_destination(),
+            2_000,
+        )
+        .unwrap();
+        let after = build_signed_claim(
+            &key,
+            &audit_regression_prevouts(252, 296_001),
+            &test_destination(),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(before.summary().input_count, 252);
+        assert!(
+            after.summary().output_sat >= before.summary().output_sat,
+            "additional marginal input reduced final payout"
+        );
+        assert_eq!(after.summary().input_count, 252);
+        assert_eq!(after.summary().excluded_dust_count, 1);
+    }
+
+    #[test]
+    fn audit_regression_group_of_inputs_can_together_pay_compactsize_overhead() {
+        let key = test_support::test_claim_key();
+        let before = build_signed_claim(
+            &key,
+            &audit_regression_prevouts(251, 298_001),
+            &test_destination(),
+            2_000,
+        )
+        .unwrap();
+        let after = build_signed_claim(
+            &key,
+            &audit_regression_prevouts(253, 298_001),
+            &test_destination(),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(after.summary().input_count, 254);
+        assert_eq!(after.summary().output_sat - before.summary().output_sat, 2);
+    }
+
+    #[test]
+    fn wallet_selected_inputs_are_deterministic_across_permutations() {
+        let key = test_support::test_claim_key();
+        let mut prevouts = audit_regression_prevouts(252, 296_001);
+        let first = build_signed_claim(&key, &prevouts, &test_destination(), 2_000).unwrap();
+        prevouts.reverse();
+        let second = build_signed_claim(&key, &prevouts, &test_destination(), 2_000).unwrap();
+        prevouts.rotate_left(17);
+        let third = build_signed_claim(&key, &prevouts, &test_destination(), 2_000).unwrap();
+        assert_eq!(first.summary().input_count, 252);
+        assert_eq!(
+            first.raw_tx_bytes_for_submission(),
+            second.raw_tx_bytes_for_submission()
+        );
+        assert_eq!(
+            first.raw_tx_bytes_for_submission(),
+            third.raw_tx_bytes_for_submission()
+        );
+        let selected = first.selected_outpoints();
+        let mut small: Vec<_> = prevouts
+            .iter()
+            .filter(|p| p.txout().value.to_sat() == 296_001)
+            .collect();
+        small.sort_by_key(|p| (p.outpoint().txid.to_byte_array(), p.outpoint().vout));
+        assert!(!selected.contains(&small.last().unwrap().outpoint()));
+    }
+
+    #[test]
+    fn wallet_builder_rejects_invalid_taproot_when_parser_is_bypassed() {
+        let address: Address<bitcoin::address::NetworkUnchecked> =
+            "bc1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqqenm"
+                .parse()
+                .unwrap();
+        let key = test_support::test_claim_key();
+        let prevout = test_support::funded_prevout(key.hash160(), 710_000_000);
+        assert_eq!(
+            build_signed_claim(&key, &[prevout], &address.assume_checked(), 2_000).unwrap_err(),
+            ClaimError::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn wallet_builder_rejects_overweight_bound_before_signing() {
+        let key = test_support::test_claim_key();
+        let prevouts: Vec<_> = (0..6757)
+            .map(|n| test_support::funded_prevout(key.hash160(), 3_000_000 + n))
+            .collect();
+        assert_eq!(
+            build_signed_claim(&key, &prevouts, &test_destination(), 2_000).unwrap_err(),
+            ClaimError::TransactionTooLarge
+        );
+    }
+
+    #[test]
+    fn wallet_all_supported_destination_types_build_and_verify() {
+        let key = test_support::test_claim_key();
+        let prevout = test_support::funded_prevout(key.hash160(), 710_000_000);
+        for text in [
+            "1QJVDzdqb1VpbDK7uDeyVXy9mR27CJiyhY",
+            "33iFwdLuRpW1uK1RTRqsoi8rR4NpDzk66k",
+            "bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw",
+            "bc1qwqdg6squsna38e46795at95yu9atm8azzmyvckulcc7kytlcckxswvvzej",
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr",
+        ] {
+            let address = crate::claim::parse_destination(
+                text,
+                bitcoin::Network::Bitcoin,
+                &p2pkh_script_for_hash160(key.hash160()),
+            )
+            .unwrap();
+            let claim =
+                build_signed_claim(&key, std::slice::from_ref(&prevout), &address, 2_000).unwrap();
+            assert_eq!(claim.summary().destination, text);
+        }
     }
 }

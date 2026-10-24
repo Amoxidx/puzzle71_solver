@@ -23,7 +23,9 @@ use puzzle71_solver::claim::{
     find_verified_found_key, p2pkh_script_for_hash160, verify_prevout,
 };
 use puzzle71_solver::puzzle_config::{RANGE_MAX, RANGE_MIN};
-use puzzle71_solver::web::server::{PublicHitStatus, SharedSolverState, start_web_server};
+use puzzle71_solver::web::server::{
+    PublicClaimSnapshot, PublicHitStatus, SharedSolverState, start_web_server,
+};
 
 /// Probe scalar inside the real Puzzle #71 range `2^70 ..= 2^71 - 1`.
 const REHEARSAL_SCALAR: u128 = (1u128 << 70) + 0x5EED_1234;
@@ -310,7 +312,6 @@ fn cmd_serve(port: u16, dir: &Path, rpc: &str, allow_production_port: bool) -> R
         libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
         libc::signal(libc::SIGTERM, handle_sigint as *const () as usize);
     }
-    SHUTDOWN_SIGNAL.store(false, Ordering::SeqCst);
 
     let hash160 = derive_hash160(REHEARSAL_SCALAR);
     let address = rehearsal_p2pkh_address(hash160);
@@ -346,12 +347,7 @@ fn cmd_serve(port: u16, dir: &Path, rpc: &str, allow_production_port: bool) -> R
 
     let shared_state = SharedSolverState::new();
     shared_state.is_running.store(false, Ordering::SeqCst);
-    let timestamp_unix = fs::metadata(&found_path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+    let timestamp_unix = scan.timestamp_unix.unwrap_or(0);
     let saved_filename = found_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -394,7 +390,8 @@ fn spawn_claim_threads<U, S, K>(
         let mut slot = shared_state.claim.lock().unwrap();
         *slot = Some(Box::new(service));
         if let Some(svc) = slot.as_ref() {
-            *shared_state.claim_snapshot.lock().unwrap() = Some(svc.state());
+            *shared_state.claim_snapshot.lock().unwrap() =
+                Some(PublicClaimSnapshot::from_service(svc.as_ref()));
         }
     }
     let claim = shared_state.claim.clone();
@@ -410,7 +407,7 @@ fn spawn_claim_threads<U, S, K>(
                 continue;
             };
             svc.poll();
-            *snapshot.lock().unwrap() = Some(svc.state());
+            *snapshot.lock().unwrap() = Some(PublicClaimSnapshot::from_service(svc.as_ref()));
         }
     });
 }

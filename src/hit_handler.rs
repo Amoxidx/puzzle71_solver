@@ -1,21 +1,46 @@
 //! Independent CPU verification and retryable, owner-only persistence of puzzle hits.
 
+use crate::claim::key::{MAX_KEY_FILE_BYTES, parse_found_key_record};
 use crate::claim::secure_zero;
 use crate::crypto::address::privkey_u128_to_address;
 use crate::puzzle_config::{PUZZLE_NUMBER, RANGE_MAX, RANGE_MIN, TARGET_ADDRESS, TARGET_HASH160};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FOUND_KEY_FILENAME: &str = "FOUND_KEY.txt";
 const COMPLETE_MARKER: &str = "END VERIFIED HIT\n";
-const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The production path and fault tests use the same ordering of writes and synchronization.
+trait PersistenceIo {
+    fn write_record(&mut self, file: &mut File, content: &[u8]) -> std::io::Result<()> {
+        file.write_all(content)
+    }
+    fn sync_file(&mut self, file: &File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+    fn sync_directory(&mut self, path: &Path) -> Result<(), String> {
+        sync_directory(path)
+    }
+}
+
+struct FilesystemIo;
+impl PersistenceIo for FilesystemIo {}
+
+#[cfg(test)]
+struct FileSyncIo(fn(&File) -> std::io::Result<()>);
+#[cfg(test)]
+impl PersistenceIo for FileSyncIo {
+    fn sync_file(&mut self, file: &File) -> std::io::Result<()> {
+        (self.0)(file)
+    }
+}
 
 /// A CPU-verified hit stays owned until persistence succeeds. Never serialized or cloned.
 pub struct VerifiedHit {
@@ -24,6 +49,8 @@ pub struct VerifiedHit {
     bitcoin_address: String,
     timestamp_unix: u64,
     staged_path: Option<PathBuf>,
+    // Keep the inode alive across retries; a remembered dev/inode pair alone permits reuse.
+    staged_file: Option<File>,
     staged_complete: bool,
     installed_path: Option<PathBuf>,
     recovered_content: Option<SensitiveText>,
@@ -97,35 +124,46 @@ impl VerifiedHit {
         Ok(())
     }
 
+    fn clear_staged(&mut self) {
+        self.staged_path = None;
+        self.staged_complete = false;
+        self.staged_file = None;
+    }
+
+    /// Checks namespace changes between retries. This is not an atomic defense against a
+    /// malicious process with the same account actively replacing paths during a syscall.
+    fn owns_staged_path(&self) -> Result<bool, String> {
+        let (Some(path), Some(owned)) = (&self.staged_path, &self.staged_file) else {
+            return Ok(false);
+        };
+        let retained = owned
+            .metadata()
+            .map_err(|error| format!("Cannot inspect owned hit staging file: {error}"))?;
+        match std::fs::symlink_metadata(path) {
+            Ok(current) => Ok(same_regular_file(&retained, &current)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("Cannot inspect hit staging pathname: {error}")),
+        }
+    }
+
+    #[cfg(test)]
     fn ensure_staged(
         &mut self,
         preferred: &Path,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<(), String> {
-        if self.staged_complete {
-            let path = self.staged_path.as_ref().expect("complete staging path");
-            let mut file = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.staged_path = None;
-                    self.staged_complete = false;
-                    return self.ensure_staged(preferred, sync_file);
-                }
-                Err(error) => {
-                    return Err(format!("Cannot reopen verified hit staging file: {error}"));
-                }
-            };
-            self.validate_record(&mut file)?;
-            // A complete record recovered from page cache is not yet proof of durable bytes.
-            sync_file(&file)
-                .map_err(|error| format!("Cannot synchronize recovered hit: {error}"))?;
-            return sync_directory(parent_dir(path));
+        self.ensure_staged_with_io(preferred, &mut FileSyncIo(sync_file))
+    }
+
+    fn ensure_staged_with_io(
+        &mut self,
+        preferred: &Path,
+        io: &mut impl PersistenceIo,
+    ) -> Result<(), String> {
+        if self.staged_path.is_some() && !self.owns_staged_path()? {
+            // Preserve a foreign replacement and allocate our own fresh path automatically.
+            self.clear_staged();
         }
-        let content = self.content();
         if self.staged_path.is_none() {
             let name = preferred
                 .file_name()
@@ -138,6 +176,7 @@ impl VerifiedHit {
                     TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ));
                 match OpenOptions::new()
+                    .read(true)
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
@@ -145,7 +184,7 @@ impl VerifiedHit {
                 {
                     Ok(file) => {
                         self.staged_path = Some(path);
-                        drop(file);
+                        self.staged_file = Some(file);
                         break;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -157,38 +196,60 @@ impl VerifiedHit {
             .staged_path
             .as_ref()
             .ok_or_else(|| "Cannot allocate a secure hit filename".to_string())?;
-        // A partial file is rewritten on retry; a replaced symlink is never followed.
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .truncate(true)
+        // Opening must not truncate or chmod anything until the opened descriptor has been
+        // compared with the retained one. Partial bytes on our own inode are retryable.
+        let mut file = OpenOptions::new()
+            .read(self.staged_complete)
+            .write(!self.staged_complete)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.staged_path = None;
-                return Err("Staged hit file disappeared; persistence will retry".to_string());
-            }
-            Err(error) => return Err(format!("Cannot open secure hit staging file: {error}")),
-        };
+            .map_err(|error| format!("Cannot open secure hit staging file: {error}"))?;
+        let retained = self.staged_file.as_ref().expect("owned staging descriptor");
+        if !same_regular_file(
+            &retained.metadata().map_err(|error| error.to_string())?,
+            &file.metadata().map_err(|error| error.to_string())?,
+        ) {
+            self.clear_staged();
+            return Err("Hit staging pathname changed; persistence will retry".to_string());
+        }
+        if self.staged_complete {
+            self.validate_record(&mut file)?;
+            // Surviving page-cache bytes do not prove that the file was synchronized.
+            io.sync_file(&file)
+                .map_err(|error| format!("Cannot synchronize recovered hit: {error}"))?;
+            return io.sync_directory(parent_dir(path));
+        }
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|error| format!("Cannot reset owned hit staging file: {error}"))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("Cannot secure hit staging file: {error}"))?;
-        file.write_all(&content.0)
+        io.write_record(&mut file, &self.content().0)
             .map_err(|error| format!("Cannot write verified hit: {error}"))?;
-        sync_file(&file).map_err(|error| format!("Cannot synchronize verified hit: {error}"))?;
+        io.sync_file(&file)
+            .map_err(|error| format!("Cannot synchronize verified hit: {error}"))?;
         self.staged_complete = true;
-        sync_directory(parent_dir(path))
+        io.sync_directory(parent_dir(path))
     }
 
     /// Storage errors retain this candidate and its complete staging file for another attempt.
     pub fn persist(&mut self, preferred: &Path) -> Result<PathBuf, String> {
-        self.persist_with_file_sync(preferred, File::sync_all)
+        self.persist_with_io(preferred, &mut FilesystemIo)
     }
 
+    #[cfg(test)]
     fn persist_with_file_sync(
         &mut self,
         preferred: &Path,
         sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<PathBuf, String> {
+        self.persist_with_io(preferred, &mut FileSyncIo(sync_file))
+    }
+
+    fn persist_with_io(
+        &mut self,
+        preferred: &Path,
+        io: &mut impl PersistenceIo,
     ) -> Result<PathBuf, String> {
         if let Some(installed) = self.installed_path.as_ref() {
             match OpenOptions::new()
@@ -198,7 +259,7 @@ impl VerifiedHit {
             {
                 Ok(mut file) => {
                     self.validate_record(&mut file)?;
-                    sync_file(&file)
+                    io.sync_file(&file)
                         .map_err(|error| format!("Cannot synchronize installed hit: {error}"))?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -210,9 +271,13 @@ impl VerifiedHit {
             }
         }
         if self.installed_path.is_none() {
-            self.ensure_staged(preferred, sync_file)?;
-            let staged = self.staged_path.as_ref().expect("completed staging file");
+            self.ensure_staged_with_io(preferred, io)?;
             for attempt in 0..100 {
+                if !self.owns_staged_path()? {
+                    self.clear_staged();
+                    return Err("Hit staging pathname changed before installation".to_string());
+                }
+                let staged = self.staged_path.as_ref().expect("completed staging file");
                 let candidate = candidate_path(preferred, self.timestamp_unix, attempt);
                 match std::fs::hard_link(staged, &candidate) {
                     Ok(()) => {
@@ -227,10 +292,16 @@ impl VerifiedHit {
         let installed = self
             .installed_path
             .as_ref()
-            .ok_or_else(|| "Cannot allocate a non-overwriting hit filename".to_string())?;
-        sync_directory(parent_dir(installed))?;
-        if let Some(staged) = self.staged_path.as_ref() {
-            match std::fs::remove_file(staged) {
+            .ok_or_else(|| "Cannot allocate a non-overwriting hit filename".to_string())?
+            .clone();
+        io.sync_directory(parent_dir(&installed))?;
+        if let Some(staged) = self.staged_path.clone() {
+            if !self.owns_staged_path()? {
+                // The installed record is durable. Leave the foreign staging name alone.
+                self.clear_staged();
+                return Ok(installed);
+            }
+            match std::fs::remove_file(&staged) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -239,10 +310,11 @@ impl VerifiedHit {
                     ));
                 }
             }
-            sync_directory(parent_dir(installed))?;
-            self.staged_path = None;
+            // The unlink succeeded even if the following directory synchronization fails.
+            self.clear_staged();
+            io.sync_directory(parent_dir(&staged))?;
         }
-        Ok(installed.clone())
+        Ok(installed)
     }
 }
 
@@ -278,6 +350,7 @@ fn verify_for_target(
             .unwrap_or_default()
             .as_secs(),
         staged_path: None,
+        staged_file: None,
         staged_complete: false,
         installed_path: None,
         recovered_content: None,
@@ -307,7 +380,7 @@ fn recover_for_target(
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
-        let Ok(file) = OpenOptions::new()
+        let Ok(mut file) = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
@@ -321,7 +394,7 @@ fn recover_for_target(
             continue;
         }
         let mut content = SensitiveText(Vec::new());
-        if file
+        if (&mut file)
             .take(MAX_KEY_FILE_BYTES + 1)
             .read_to_end(&mut content.0)
             .is_err()
@@ -335,33 +408,25 @@ fn recover_for_target(
         if !text.ends_with(COMPLETE_MARKER) {
             continue;
         }
-        let values = text
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .strip_prefix("PRIVATE KEY (HEX):")
-                    .map(str::trim)
-            })
-            .collect::<Vec<_>>();
-        if values.len() != 1 {
-            continue;
-        }
-        let Some(hex) = values[0].strip_prefix("0x") else {
-            continue;
-        };
-        let Ok(key) = u128::from_str_radix(hex, 16) else {
+        let Ok((key, timestamp)) = parse_found_key_record(&content.0) else {
             continue;
         };
         let Ok(mut hit) = verify_for_target(key, address, hash, range.clone()) else {
             continue;
         };
         hit.staged_path = Some(path);
+        hit.staged_file = Some(file);
         hit.staged_complete = true;
+        hit.timestamp_unix = timestamp.unwrap_or(0);
         // Keep the exact verified record, including its original timestamp, across retries.
         hit.recovered_content = Some(content);
         return Ok(Some(hit));
     }
     Ok(None)
+}
+
+fn same_regular_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.is_file() && right.is_file() && left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 fn parent_dir(path: &Path) -> &Path {
@@ -510,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_staging_replacement_is_rejected_without_installing_foreign_bytes() {
+    fn complete_staging_replacement_is_preserved_while_a_fresh_record_is_installed() {
         let dir = temp_dir("replaced-staging");
         let path = dir.join(FOUND_KEY_FILENAME);
         let mut hit = fixture();
@@ -519,11 +584,8 @@ mod tests {
         std::fs::remove_file(&staged).unwrap();
         std::fs::write(&staged, b"unrelated replacement").unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(hit.persist(&path).is_err());
-        assert!(!path.exists());
-        assert_eq!(std::fs::read(&staged).unwrap(), b"unrelated replacement");
-        std::fs::remove_file(&staged).unwrap();
         assert_eq!(hit.persist(&path).unwrap(), path);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"unrelated replacement");
         crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -748,5 +810,317 @@ mod tests {
         assert!(verify_candidate(1).is_err());
         assert!(verify_for_target(1, TARGET_ADDRESS, TARGET_HASH160, 1..=1).is_err());
         assert!(verify_for_target(1, ADDRESS, HASH, 2..=2).is_err());
+    }
+
+    fn foreign_partial_stage_fixture() -> (PathBuf, VerifiedHit, PathBuf, PathBuf, PathBuf) {
+        let dir = temp_dir("audit-partial-foreign");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let foreign = dir.join("unrelated.txt");
+        let sentinel = b"unrelated public fixture bytes";
+        let mut hit = fixture();
+        assert!(
+            hit.persist_with_file_sync(&path, |_| Err(std::io::Error::other(
+                "injected sync failure"
+            )))
+            .is_err()
+        );
+        let staged = hit.staged_path.clone().unwrap();
+        let retained_inode = hit.staged_file.as_ref().unwrap().metadata().unwrap().ino();
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&foreign, sentinel).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&foreign, &staged).unwrap();
+        // The production-owned descriptor keeps the unlinked inode alive, preventing ABA.
+        assert_eq!(
+            hit.staged_file.as_ref().unwrap().metadata().unwrap().ino(),
+            retained_inode
+        );
+        assert_ne!(std::fs::metadata(&staged).unwrap().ino(), retained_inode);
+        (dir, hit, path, staged, foreign)
+    }
+
+    #[test]
+    fn audit_regression_partial_retry_preserves_a_foreign_hardlink() {
+        let (dir, mut hit, path, _staged, foreign) = foreign_partial_stage_fixture();
+        let _retry = hit.persist(&path);
+        assert!(
+            std::fs::read(&foreign).unwrap() == b"unrelated public fixture bytes",
+            "partial retry overwrote unrelated hardlink target"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_partial_retry_preserves_foreign_permissions() {
+        let (dir, mut hit, path, _staged, foreign) = foreign_partial_stage_fixture();
+        let _retry = hit.persist(&path);
+        assert_eq!(
+            std::fs::metadata(&foreign).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_partial_retry_finishes_without_deleting_the_foreign_stage() {
+        let (dir, mut hit, path, staged, foreign) = foreign_partial_stage_fixture();
+        let result = hit.persist(&path).or_else(|_| hit.persist(&path));
+        assert_eq!(result.unwrap(), path);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        assert!(staged.exists());
+        assert!(std::fs::read(&foreign).unwrap() == b"unrelated public fixture bytes");
+        assert_eq!(
+            std::fs::metadata(&foreign).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_installed_retry_preserves_foreign_stage_name() {
+        let dir = temp_dir("audit-cleanup-foreign");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        let retained_inode = File::open(&staged).unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&staged, b"only copy of unrelated public fixture").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let retry = hit.persist(&path).or_else(|_| hit.persist(&path));
+        assert_eq!(retry.unwrap(), path);
+        assert!(staged.exists(), "cleanup deleted a foreign replacement");
+        assert!(std::fs::read(&staged).unwrap() == b"only copy of unrelated public fixture");
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        drop(retained_inode);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_recovery_preserves_original_public_timestamp() {
+        let dir = temp_dir("audit-timestamp");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut original = fixture();
+        original.timestamp_unix = 42;
+        let original_bytes = original.content();
+        original.ensure_staged(&path, File::sync_all).unwrap();
+        let mut recovered = recover_for_target(&dir, ADDRESS, HASH, 1..=1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.timestamp_unix(),
+            42,
+            "public timestamp must match retained original record"
+        );
+        recovered.persist(&path).unwrap();
+        assert!(std::fs::read(&path).unwrap() == original_bytes.0);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct ShortWriteIo;
+    impl PersistenceIo for ShortWriteIo {
+        fn write_record(&mut self, file: &mut File, content: &[u8]) -> std::io::Result<()> {
+            file.write_all(&content[..17])?;
+            Err(std::io::Error::other(
+                "injected error after a real short write",
+            ))
+        }
+    }
+
+    #[test]
+    fn audit_regression_own_short_write_retries_on_the_same_owned_inode() {
+        let dir = temp_dir("short-write");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut hit = fixture();
+        assert!(hit.persist_with_io(&path, &mut ShortWriteIo).is_err());
+        let staged = hit.staged_path.clone().unwrap();
+        let inode = std::fs::metadata(&staged).unwrap().ino();
+        assert_eq!(std::fs::metadata(&staged).unwrap().len(), 17);
+        assert!(!hit.staged_complete);
+        assert!(!path.exists());
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_short_write_foreign_replacement_survives_automatic_retry() {
+        let dir = temp_dir("short-write-foreign");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut hit = fixture();
+        assert!(hit.persist_with_io(&path, &mut ShortWriteIo).is_err());
+        let staged = hit.staged_path.clone().unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&staged, b"unrelated public replacement").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            hit.persist(&path).or_else(|_| hit.persist(&path)).unwrap(),
+            path
+        );
+        assert!(std::fs::read(&staged).unwrap() == b"unrelated public replacement");
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct FailDirectorySync {
+        calls: usize,
+        fail_at: usize,
+    }
+    impl PersistenceIo for FailDirectorySync {
+        fn sync_directory(&mut self, path: &Path) -> Result<(), String> {
+            self.calls += 1;
+            if self.calls == self.fail_at {
+                return Err("injected hit directory synchronization failure".to_string());
+            }
+            sync_directory(path)
+        }
+    }
+
+    #[test]
+    fn audit_regression_post_unlink_sync_failure_clears_owned_stage_before_retry() {
+        let dir = temp_dir("post-unlink-sync");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut hit = fixture();
+        hit.ensure_staged(&path, File::sync_all).unwrap();
+        let staged = hit.staged_path.clone().unwrap();
+        let mut io = FailDirectorySync {
+            calls: 0,
+            fail_at: 3,
+        };
+        // Reopen-stage sync, final-link sync, then unlink and the failing directory sync.
+        assert!(hit.persist_with_io(&path, &mut io).is_err());
+        assert_eq!(io.calls, 3);
+        assert!(!staged.exists());
+        assert!(path.exists());
+        assert!(hit.staged_path.is_none());
+        assert!(hit.staged_file.is_none());
+        assert!(!hit.staged_complete);
+        std::fs::write(&staged, b"new unrelated public record").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        assert!(std::fs::read(&staged).unwrap() == b"new unrelated public record");
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_failed_final_directory_sync_keeps_the_only_stage_link() {
+        let dir = temp_dir("pre-unlink-sync");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut hit = fixture();
+        let mut io = FailDirectorySync {
+            calls: 0,
+            fail_at: 2,
+        };
+        assert!(hit.persist_with_io(&path, &mut io).is_err());
+        let staged = hit.staged_path.clone().unwrap();
+        assert!(staged.exists());
+        assert!(hit.staged_file.is_some());
+        crate::claim::ClaimKey::load_found_key_file(&staged, HASH, 1..=1).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_invalid_timestamp_metadata_keeps_a_valid_staged_key() {
+        for metadata in [
+            "",
+            "TIMESTAMP (UNIX): invalid\n",
+            "TIMESTAMP (UNIX): 18446744073709551616\n",
+            "TIMESTAMP (UNIX): 42\nTIMESTAMP (UNIX): 42\n",
+            "TIMESTAMP (UNIX): broken\nTIMESTAMP (UNIX): 42\n",
+        ] {
+            let dir = temp_dir("invalid-time");
+            let staged = dir.join(".FOUND_KEY.public-fixture.tmp");
+            let bytes = format!("{metadata}PRIVATE KEY (HEX): 0x1\n{COMPLETE_MARKER}");
+            std::fs::write(&staged, bytes.as_bytes()).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut hit = recover_for_target(&dir, ADDRESS, HASH, 1..=1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(hit.timestamp_unix(), 0);
+            let path = dir.join(FOUND_KEY_FILENAME);
+            assert_eq!(hit.persist(&path).unwrap(), path);
+            assert!(std::fs::read(&path).unwrap() == bytes.as_bytes());
+            let (_, timestamp) =
+                crate::claim::ClaimKey::load_found_key_file_with_timestamp(&path, HASH, 1..=1)
+                    .unwrap();
+            assert_eq!(timestamp, None);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn audit_regression_partial_stage_saves_under_umask_0400_in_subprocess() {
+        const CHILD_MODE: &str = "PUZZLE71_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            // Only this isolated child changes its process-wide umask. Keep directory
+            // permissions independent of the file-creation case under examination.
+            let dir = temp_dir("umask-write-only");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = dir.join(FOUND_KEY_FILENAME);
+            let mut hit = fixture();
+            // SAFETY: the child runs only this test; no parallel test can inherit this mask.
+            let previous_mask = unsafe { libc::umask(0o400) };
+            let first = hit.persist(&path);
+            if first.is_err() {
+                let staged = hit.staged_path.as_ref().expect("own initial staging file");
+                assert_eq!(
+                    std::fs::metadata(staged).unwrap().permissions().mode() & 0o777,
+                    0o200,
+                    "the failed reopen must have left the initial write-only mode"
+                );
+            }
+            let result = first.or_else(|_| hit.persist(&path));
+            // SAFETY: restore the child process's original mask before assertions/cleanup.
+            unsafe { libc::umask(previous_mask) };
+            assert_eq!(
+                result.expect("a write-only initial stage must save without manual repair"),
+                path
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hit_handler::tests::audit_regression_partial_stage_saves_under_umask_0400_in_subprocess"])
+            .env(CHILD_MODE, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "umask0400 child could not durably save its candidate"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("umask0400 child blocked the hit persistence path");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

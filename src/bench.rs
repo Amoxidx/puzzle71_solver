@@ -2,7 +2,8 @@
 
 use crate::crypto::cpu_engine::cpu_incremental_scan;
 use crate::metal_engine::metal_solver::{DispatchOutcome, MetalSolver};
-use crate::power::controller::{PowerGovernor, PowerMode};
+use crate::power::controller::PowerGovernor;
+use crate::power::monitor::PowerMonitor;
 use crate::puzzle_config::RANGE_MIN;
 use crate::search::profile::{ALL_POWER_MODES, DispatchProfile, dispatch_profile};
 use std::thread;
@@ -36,7 +37,7 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) -> Result<(), String>
 
     // 1. CPU Benchmark (Pure Rust CPU Reference)
     println!("-> Benchmarking Pure Rust CPU Reference Engine (100,000 keys)...");
-    let mut cpu_gov = PowerGovernor::new(PowerMode::Balanced);
+    let mut cpu_monitor = PowerMonitor::new();
     let cpu_start = Instant::now();
     let cpu_keys = 100_000u128;
     if cpu_incremental_scan(RANGE_MIN, RANGE_MIN + cpu_keys - 1, &dummy_target).is_some() {
@@ -45,7 +46,7 @@ pub fn run_comprehensive_benchmark(electricity_price: f64) -> Result<(), String>
         );
     }
     let cpu_elapsed = cpu_start.elapsed().as_secs_f64();
-    let cpu_metrics = cpu_gov.update();
+    let cpu_metrics = cpu_monitor.sample(0.0);
     let cpu_rate = (cpu_keys as f64) / cpu_elapsed.max(0.001);
     let cpu_watts = cpu_metrics.package_power_watts.max(0.1);
     let cpu_kpj = cpu_rate / (cpu_watts as f64);
@@ -209,6 +210,7 @@ impl BenchmarkProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::power::controller::PowerMode;
 
     #[test]
     fn failed_dispatch_does_not_count_or_advance_the_search_range() {

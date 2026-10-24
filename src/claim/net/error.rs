@@ -22,6 +22,8 @@ pub enum NetError {
     HttpStatus(u16),
     /// The response body was missing, not JSON of the expected shape, or otherwise unusable.
     BadResponse,
+    /// The response exceeded the bounded HTTP body buffer.
+    ResponseTooLarge,
     /// The two independent UTXO sources did not report the same confirmed `(txid, vout, value)` set.
     SourcesDisagree,
     /// A confirmed UTXO's API-reported value did not match the value in the raw previous transaction.
@@ -48,6 +50,7 @@ impl fmt::Display for NetError {
             },
             NetError::HttpStatus(status) => write!(f, "unexpected HTTP status {status}"),
             NetError::BadResponse => f.write_str("unusable HTTP response"),
+            NetError::ResponseTooLarge => f.write_str("HTTP response exceeds size limit"),
             NetError::SourcesDisagree => f.write_str("UTXO sources disagree"),
             NetError::SourceValueMismatch => {
                 f.write_str("UTXO API value does not match previous transaction")
@@ -79,6 +82,7 @@ mod tests {
             NetError::Transport { exit_code: None },
             NetError::HttpStatus(500),
             NetError::BadResponse,
+            NetError::ResponseTooLarge,
             NetError::SourcesDisagree,
             NetError::SourceValueMismatch,
             NetError::Rejected("<hex>".to_string()),

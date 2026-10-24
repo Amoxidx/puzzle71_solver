@@ -17,6 +17,8 @@ let lastClaimTxidLogged = null;
 let preparedDestination = null;
 let lastPreparedTxid = null;
 let preparedRenderValid = false;
+let preparedEdited = false;
+let previewNeedsRecheck = false;
 let claimStoragePending = false;
 let claimServerBusy = false;
 let claimRevision = 0;
@@ -85,7 +87,13 @@ document.addEventListener("DOMContentLoaded", () => {
   byId("btn-claim-confirm").addEventListener("click", confirmClaim);
   byId("claim-destination").addEventListener("blur", hintDestination);
   byId("claim-destination").addEventListener("input", () => {
-    preparedRenderValid = false;
+    if (preparedDestination) {
+      preparedEdited = true;
+      previewNeedsRecheck = false;
+      preparedRenderValid = false;
+      setHidden("claim-step-summary", true);
+      setHidden("claim-step-confirm", true);
+    }
     syncClaimButtons();
   });
 
@@ -158,7 +166,7 @@ function updateUI(data, revision = claimRevision) {
   } else {
     setStatus("paused", "PAUSIERT");
   }
-  byId("status-mode").textContent = `${MODE_LABELS[currentMode] || currentMode.toUpperCase()} · LIMIT ${formatOne(dutyLimit)}%`;
+  setTextIfChanged(byId("status-mode"), `${MODE_LABELS[currentMode] || currentMode.toUpperCase()} · LIMIT ${formatOne(dutyLimit)}%`);
 
   const toggle = byId("btn-toggle-run");
   toggle.className = isRunning ? "btn btn-danger" : "btn btn-primary";
@@ -177,42 +185,65 @@ function updateUI(data, revision = claimRevision) {
   const averageSpeed = finiteNumber(data.avg_keys_per_sec);
   byId("val-speed-mkeys").textContent = (currentSpeed / 1_000_000).toFixed(2);
   byId("val-speed-current").textContent = `${formatNumber(Math.round(currentSpeed))} keys/s`;
-  byId("val-speed-avg").textContent = `${formatNumber(Math.round(averageSpeed))} keys/s`;
+  const progressAvailable = data.progress_available !== false;
+  setTextIfChanged(byId("val-speed-avg"), progressAvailable
+    ? `${formatNumber(Math.round(averageSpeed))} keys/s`
+    : "Nicht verfügbar");
 
   const watts = finiteNumber(data.estimated_package_power_watts);
-  byId("val-power-watts").textContent = watts.toFixed(1);
+  const hasDispatchSample = finiteNumber(data.last_gpu_active_ms) + finiteNumber(data.last_throttle_sleep_ms) > 0;
+  setTextIfChanged(byId("val-power-watts"), hasDispatchSample ? watts.toFixed(1) : "Nicht verfügbar");
   const keysPerJoule = watts > 0 ? currentSpeed / watts : 0;
-  byId("val-keys-per-joule").textContent = `${(keysPerJoule / 1_000_000).toFixed(2)} Mkeys/Joule`;
-  byId("val-keys-per-kwh").textContent = `${(keysPerJoule * 3_600_000 / 1_000_000_000).toFixed(2)} Bkeys/kWh`;
+  setTextIfChanged(byId("val-keys-per-joule"), hasDispatchSample ? `${(keysPerJoule / 1_000_000).toFixed(2)} Mkeys/Joule` : "Nicht verfügbar");
+  setTextIfChanged(byId("val-keys-per-kwh"), hasDispatchSample ? `${(keysPerJoule * 3_600_000 / 1_000_000_000).toFixed(2)} Bkeys/kWh` : "Nicht verfügbar");
 
-  byId("val-soc-temp").textContent = finiteNumber(data.estimated_soc_temp_celsius).toFixed(1);
+  setTextIfChanged(byId("val-soc-temp"), hasDispatchSample ? finiteNumber(data.estimated_soc_temp_celsius).toFixed(1) : "Nicht verfügbar");
   byId("val-cpu-load").textContent = `${finiteNumber(data.process_cpu_load_pct).toFixed(1)}%`;
-  byId("val-runtime").textContent = formatTime(data.runtime_secs);
+  setTextIfChanged(byId("val-runtime"), progressAvailable ? formatTime(data.runtime_secs) : "Nicht verfügbar");
   byId("val-gpu-duty").textContent = `${measuredDuty(data).toFixed(1)}% (Limit ${formatOne(dutyLimit)}%)`;
 
-  const totalKeys = parseNonNegativeBigInt(data.total_keys_tested);
-  byId("val-total-keys").textContent = formatBigInt(totalKeys);
-  byId("val-total-blocks").textContent = formatNumber(finiteNumber(data.total_blocks_tested));
-  const coverage = Math.min(Number(totalKeys) / RANGE_SIZE_NUMBER, 1);
+  const totalKeys = progressAvailable ? parseNonNegativeBigInt(data.total_keys_tested) : 0n;
+  setTextIfChanged(byId("val-total-keys"), progressAvailable ? formatBigInt(totalKeys) : "Nicht verfügbar");
+  setTextIfChanged(byId("val-total-blocks"), progressAvailable ? formatNumber(finiteNumber(data.total_blocks_tested)) : "Nicht verfügbar");
+  const coverage = progressAvailable ? Math.min(Number(totalKeys) / RANGE_SIZE_NUMBER, 1) : 0;
   const coveragePct = coverage * 100;
-  byId("val-coverage-pct").textContent = `${coveragePct.toFixed(12)}%`;
+  setTextIfChanged(byId("val-coverage-pct"), progressAvailable ? `${coveragePct.toFixed(12)}%` : "Nicht verfügbar");
   byId("coverage-meter-fill").style.transform = `scaleX(${coverage})`;
   byId("coverage-meter").setAttribute("aria-valuenow", String(coveragePct));
-  byId("val-checkpoint").textContent = formatUnixTimestamp(data.checkpoint_saved_timestamp, "Noch nicht gespeichert");
+  byId("coverage-meter").setAttribute("aria-valuetext", progressAvailable
+    ? `Gezählte Historie: ${coveragePct.toFixed(12)} Prozent`
+    : "Suchhistorie nicht verfügbar");
+  setTextIfChanged(byId("val-checkpoint"), progressAvailable
+    ? formatUnixTimestamp(data.checkpoint_saved_timestamp, "Noch nicht gespeichert")
+    : "Nicht verfügbar");
+  setTextIfChanged(byId("history-note"), progressAvailable
+    ? "Übernommene Einträge wurden nicht automatisch rückwirkend nachgeprüft."
+    : "Suchhistorie beim Trefferstart nicht verfügbar; der leere Wert bedeutet nicht null.");
 
   const runtime = finiteNumber(data.runtime_secs);
-  const kwhConsumed = watts * runtime / 3_600_000;
+  const kwhProjected = watts * runtime / 3_600_000;
   const dailyCost = watts * 24 / 1000 * electricityRate;
-  byId("val-cost-start").textContent = `${(kwhConsumed * electricityRate).toFixed(4)} €`;
-  byId("val-cost-day").textContent = `${dailyCost.toFixed(2)} €`;
-  byId("val-cost-month").textContent = `${(dailyCost * 30.416).toFixed(2)} €`;
-  byId("val-cost-year").textContent = `${(dailyCost * 365.25).toFixed(2)} €`;
+  const euro4 = new Intl.NumberFormat("de-DE", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  const euro2 = new Intl.NumberFormat("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  setTextIfChanged(byId("val-cost-start"), progressAvailable && hasDispatchSample ? `${euro4.format(kwhProjected * electricityRate)} €` : "Nicht verfügbar");
+  setTextIfChanged(byId("val-cost-day"), hasDispatchSample ? `${euro2.format(dailyCost)} €` : "Nicht verfügbar");
+  setTextIfChanged(byId("val-cost-month"), hasDispatchSample ? `${euro2.format(dailyCost * 30.416)} €` : "Nicht verfügbar");
+  setTextIfChanged(byId("val-cost-year"), hasDispatchSample ? `${euro2.format(dailyCost * 365.25)} €` : "Nicht verfügbar");
 
-  renderOdds(Math.max(averageSpeed, currentSpeed, 0));
+  setTextIfChanged(byId("model-state-note"), !hasDispatchSample
+    ? "Modellwerte noch nicht verfügbar; ein GPU-Dispatch liegt noch nicht vor."
+    : isRunning
+      ? "Temperatur geschätzt; Prozess-CPU ist ein Prozesswert."
+      : "Temperaturmodell zeigt den letzten Dispatch; Prozess-CPU ist ein Prozesswert.");
+  const oddsRate = isRunning ? Math.max(averageSpeed, currentSpeed, 0) : 0;
+  setTextIfChanged(byId("odds-note"), isRunning
+    ? "Projektion bei aktueller gemessener Rate."
+    : "Suche pausiert: aktuell keine Trefferchance; Projektion wird nicht fortgeschrieben.");
+  renderOdds(oddsRate);
   renderHit(data.hit);
   claimStoragePending = Boolean(data.hit && data.hit.storage_pending);
   if ((revision === claimRevision && (!claimPending || claimAwaitingOutcome)) || claimStoragePending) {
-    renderClaim(data.claim, data.hit, data.claim_busy);
+    renderClaim(data.claim, data.hit, data.claim_busy, data.claim_status_details);
   }
 
   if (data.last_error && data.last_error !== lastError) {
@@ -222,8 +253,16 @@ function updateUI(data, revision = claimRevision) {
 }
 
 function setStatus(kind, text) {
-  byId("status-pill").className = `status-pill status-${kind}`;
-  byId("status-text").textContent = text;
+  setClassIfChanged(byId("status-pill"), `status-pill status-${kind}`);
+  setTextIfChanged(byId("status-text"), text);
+}
+
+function setClassIfChanged(element, value) {
+  if (element && element.className !== value) element.className = value;
+}
+
+function setTextIfChanged(element, value) {
+  if (element && element.textContent !== value) element.textContent = value;
 }
 
 function measuredDuty(data) {
@@ -236,15 +275,21 @@ function renderHit(hit) {
   if (!hit) return;
   const pending = Boolean(hit.storage_pending);
   byId("hit-alert").classList.remove("hidden");
-  byId("hit-title").textContent = pending
+  setTextIfChanged(byId("hit-title"), pending
     ? "Treffer bestätigt – Speicherung wird wiederholt"
-    : "PUZZLE #71 TREFFER VERIFIZIERT";
-  byId("hit-subtitle").textContent = pending
-    ? "Der Treffer bleibt im Speicher. Die lokale Speicherung wird erneut versucht; die Auszahlung wird danach freigegeben."
-    : "Der Treffer wurde auf der CPU verifiziert. Der Private Key ist ausschließlich in der lokalen Datei gespeichert und wird niemals über die Web-API übertragen.";
-  byId("hit-address").textContent = hit.bitcoin_address;
-  byId("hit-filename").textContent = pending ? "Speicherung ausstehend" : hit.saved_filename;
-  byId("hit-timestamp").textContent = formatUnixTimestamp(hit.timestamp_unix, "Unbekannt");
+    : "PUZZLE #71 TREFFER VERIFIZIERT");
+  setTextIfChanged(byId("hit-subtitle"), pending
+    ? "Der Treffer ist auf der CPU verifiziert. Die lokale Speicherung wird erneut versucht; den Prozess weiterlaufen lassen. Die Auszahlung bleibt bis zum Speichern gesperrt."
+    : "Der Treffer wurde auf der CPU verifiziert. Der Private Key ist ausschließlich in der lokalen Datei gespeichert und wird niemals über die Web-API übertragen.");
+  setTextIfChanged(byId("hit-address"), hit.bitcoin_address);
+  setTextIfChanged(byId("hit-filename"), pending ? "Speicherung ausstehend" : hit.saved_filename);
+  setTextIfChanged(byId("hit-timestamp"), formatUnixTimestamp(hit.timestamp_unix, "Unbekannt"));
+  const verificationStatus = byId("hit-verification-status");
+  verificationStatus.classList.toggle("hit-badge-pending", pending);
+  verificationStatus.classList.toggle("hit-badge-success", !pending);
+  setTextIfChanged(verificationStatus, pending
+    ? "CPU-VERIFIZIERT · SPEICHERUNG AUSSTEHEND"
+    : "CPU-VERIFIZIERT · DATEIRECHTE 0600");
   const identity = `${hit.timestamp_unix}:${pending}`;
   if (identity !== lastHitTimestamp) {
     lastHitTimestamp = identity;
@@ -281,15 +326,19 @@ function normalizeDestination(value) {
 }
 
 function destinationEditedAfterPrepare() {
-  return normalizeDestination(byId("claim-destination").value) !== normalizeDestination(preparedDestination);
+  return preparedEdited || Boolean(normalizeDestination(byId("claim-destination").value)
+    && normalizeDestination(byId("claim-destination").value) !== normalizeDestination(preparedDestination));
 }
 
 function invalidatePreview() {
   preparedRenderValid = false;
+  preparedEdited = false;
+  previewNeedsRecheck = false;
   preparedDestination = null;
   lastPreparedTxid = null;
   setHidden("claim-step-summary", true);
   setHidden("claim-step-confirm", true);
+  setTextIfChanged(byId("claim-preview-status"), "");
 }
 
 function satToBtc(sat) {
@@ -303,25 +352,49 @@ function renderPrepared(summary, authorized = false) {
   preparedDestination = destination;
   lastPreparedTxid = txid;
   // Only a successful response to this tab's explicit prepare action authorizes Send.
-  if (authorized) preparedRenderValid = Boolean(destination && /^[0-9a-f]{64}$/.test(txid));
+  if (authorized) {
+    preparedEdited = false;
+    previewNeedsRecheck = false;
+    preparedRenderValid = Boolean(destination && /^[0-9a-f]{64}$/.test(txid));
+  } else if (!preparedRenderValid) {
+    previewNeedsRecheck = true;
+  }
   byId("claim-summary-destination").textContent = destination;
   byId("claim-summary-inputs").textContent = `${summary.input_count} · ${satToBtc(summary.total_input_sat)} BTC`;
   byId("claim-summary-fee").textContent = `${formatNumber(summary.fee_sat)} sat · ${formatOne(summary.effective_fee_rate_sat_vb)} sat/vB`;
   byId("claim-summary-payout").textContent = `${satToBtc(summary.output_sat)} BTC`;
   byId("claim-summary-dust").textContent = `${summary.excluded_dust_count} · ${formatNumber(summary.excluded_dust_sat)} sat`;
-  setHidden("claim-step-summary", false);
-  setHidden("claim-step-confirm", false);
+  if (preparedEdited) {
+    setHidden("claim-step-summary", true);
+    setHidden("claim-step-confirm", true);
+    setTextIfChanged(byId("claim-destination-mismatch"), "Adresse geändert – alte Vorschau verworfen. Bitte erneut prüfen.");
+  } else {
+    setHidden("claim-step-summary", false);
+    setHidden("claim-step-confirm", false);
+    setTextIfChanged(byId("claim-preview-status"), previewNeedsRecheck
+      ? "Gespeicherte Vorschau – bitte in diesem Tab erneut prüfen, bevor du sendest."
+      : "");
+  }
 }
 
-function renderClaim(claim, hit, claimBusy) {
+function renderClaim(claim, hit, claimBusy, statusDetails = null) {
   claimServerBusy = Boolean(claimBusy);
-  if (!hit || hit.storage_pending || claim == null) {
+  if (!hit || hit.storage_pending || (claim == null && !claimServerBusy && !claimPending)) {
     byId("claim-panel").classList.add("hidden");
     invalidatePreview();
     syncClaimButtons();
     return;
   }
   byId("claim-panel").classList.remove("hidden");
+  if (claim == null) {
+    setHidden("claim-step-destination", false);
+    setHidden("claim-step-summary", true);
+    setHidden("claim-step-confirm", true);
+    setHidden("claim-step-result", true);
+    invalidatePreview();
+    syncClaimButtons();
+    return;
+  }
   const phase = claimPhase(claim);
   const fields = claimFields(claim);
   if (claimAwaitingOutcome) {
@@ -344,23 +417,43 @@ function renderClaim(claim, hit, claimBusy) {
     invalidatePreview();
   }
   const status = byId("claim-result-status");
-  byId("claim-result-txid").textContent = fields.txid || "";
-  byId("claim-result-detail").textContent = "";
+  const providerUnavailable = Boolean(statusDetails?.unavailable);
+  const displayedTxid = fields.txid || (phase === "Failed" ? statusDetails?.pending_txid : "") || "";
+  setTextIfChanged(byId("claim-result-txid"), displayedTxid);
+  setHidden("claim-result-txid-row", !displayedTxid);
+  let resultDetail = "";
   if (phase === "Submitted") {
-    status.textContent = "Eingereicht";
-    byId("claim-result-detail").textContent = "Die Einreichung ist noch keine Blockbestätigung. Der Status wird weiter geprüft.";
+    setTextIfChanged(status, providerUnavailable
+      ? "Eingereicht · Statusabfragen nicht erreichbar"
+      : "Eingereicht");
+    resultDetail = "Die Einreichung ist noch keine Blockbestätigung. Der Status wird weiter geprüft.";
     if (fields.txid && fields.txid !== lastClaimTxidLogged) {
       lastClaimTxidLogged = fields.txid;
       addLog(`[CLAIM] Eingereicht: ${fields.txid}`, "success");
     }
   } else if (phase === "Confirmed") {
-    status.textContent = `Bestätigt in Block ${fields.block_height}`;
+    setTextIfChanged(status, statusDetails?.unavailable
+      ? `Zuletzt bekannt: bestätigt in Block ${fields.block_height} · Statusabfragen nicht erreichbar`
+      : `Bestätigt in Block ${fields.block_height}`);
   } else if (phase === "Failed") {
-    status.textContent = "Einreichung prüfen";
-    byId("claim-result-detail").textContent = CLAIM_FAILED_TEXT[fields.reason] || claimErrorText(fields.reason);
+    setTextIfChanged(status, providerUnavailable
+      ? "Einreichung prüfen · Statusabfragen nicht erreichbar"
+      : "Einreichung prüfen");
+    resultDetail = CLAIM_FAILED_TEXT[fields.reason] || claimErrorText(fields.reason);
   } else {
-    status.textContent = "";
+    setTextIfChanged(status, "");
   }
+  setClassIfChanged(status, `claim-result-status ${phase === "Submitted" ? "claim-status-submitted" : phase === "Confirmed" ? "claim-status-confirmed" : phase === "Failed" ? "claim-status-failed" : ""}${providerUnavailable ? " claim-status-stale" : ""}`);
+  if (["Submitted", "Confirmed", "Failed"].includes(phase) && statusDetails && typeof statusDetails === "object") {
+    if (providerUnavailable) {
+      const lastAttempt = formatUnixTimestamp(statusDetails.last_attempt_unix, "");
+      const lastSuccess = formatUnixTimestamp(statusDetails.last_success_unix, "");
+      resultDetail = [resultDetail, "Statusabfragen derzeit nicht erreichbar.", lastAttempt && `Letzter Versuch: ${lastAttempt}.`, lastSuccess ? `Zuletzt erfolgreich abgefragt: ${lastSuccess}.` : "Zeitpunkt der letzten erfolgreichen Abfrage nicht verfügbar."].filter(Boolean).join(" ");
+    } else if (statusDetails.last_success_unix) {
+      resultDetail = [resultDetail, `Letzter Statusabruf: ${formatUnixTimestamp(statusDetails.last_success_unix, "Unbekannt")}.`].filter(Boolean).join(" ");
+    }
+  }
+  setTextIfChanged(byId("claim-result-detail"), resultDetail);
   lastClaimPhase = phase;
   syncClaimButtons();
 }
@@ -370,8 +463,12 @@ function syncClaimButtons() {
   byId("btn-claim-prepare").disabled = blocked;
   byId("claim-destination").disabled = blocked;
   byId("btn-claim-confirm").disabled = blocked || !preparedRenderValid || !lastPreparedTxid || destinationEditedAfterPrepare();
-  byId("claim-destination-mismatch").textContent = preparedDestination && destinationEditedAfterPrepare()
-    ? "Adresse geändert – bitte erneut prüfen" : "";
+  setTextIfChanged(byId("claim-destination-mismatch"), preparedDestination && preparedEdited
+    ? "Adresse geändert – alte Vorschau verworfen. Bitte erneut prüfen."
+    : "");
+  setTextIfChanged(byId("claim-busy-notice"), claimPending || claimServerBusy
+    ? "Vorgang läuft – Status wird aktualisiert."
+    : "");
 }
 
 function hintDestination() {
@@ -410,8 +507,8 @@ async function withClaimAction(kind, action, errorTarget) {
 }
 
 function clearClaimActionErrors() {
-  byId("claim-destination-error").textContent = "";
-  byId("claim-confirm-error").textContent = "";
+  setTextIfChanged(byId("claim-destination-error"), "");
+  setTextIfChanged(byId("claim-confirm-error"), "");
 }
 
 function prepareClaim() {
