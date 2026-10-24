@@ -98,7 +98,7 @@ Alle Profile sind global auf höchstens 90 % GPU-Duty begrenzt. Nach jedem Metal
 
 Die Power- und Temperaturwerte im Dashboard sind Schätzwerte aus Prozess-/Systemlast und einem Modell; sie sind keine Messung eines externen Wattmeters oder Temperatursensors.
 
-Die angezeigte Leerlaufzeit des letzten Dispatchs wird tatsächlich gemessen. Das Duty-Limit bestimmt die mindestens angeforderte Pause; der macOS-Scheduler kann sie verlängern. Die Startdienst-Einstellung `ProcessType` beeinflusst diese Zeitsteuerung und weitere CPU-/I/O-Beschränkungen. `Interactive` hebt gegenüber `Standard` solche Beschränkungen auf; das konfigurierte GPU-Duty-Limit bleibt bestehen. Eine höhere Suchrate ist kein Nachweis gleicher Leistungsaufnahme.
+Die Status-API meldet die tatsächlich gemessene Leerlaufzeit des letzten Dispatchs; der angezeigte Dispatch-Anteil verwendet diese Messung. Das Duty-Limit bestimmt die mindestens angeforderte Pause; der macOS-Scheduler kann sie verlängern. Die Startdienst-Einstellung `ProcessType` beeinflusst diese Zeitsteuerung und weitere CPU-/I/O-Beschränkungen. `Interactive` hebt gegenüber `Standard` solche Beschränkungen auf; das konfigurierte GPU-Duty-Limit bleibt bestehen. Eine höhere Suchrate ist kein Nachweis gleicher Leistungsaufnahme.
 
 ## Checkpoints und Fortsetzen
 
