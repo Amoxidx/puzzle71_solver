@@ -159,6 +159,30 @@ test("lost confirm response recovers Submitted through polling without another r
   expect(calls).toBe(1);
 });
 
+for (const phase of ["Submitted", "Confirmed"]) {
+  test(`HTTP submission_unknown warning clears after polled ${phase} without another send`, async ({ page }) => {
+    const live = await openClaim(page);
+    await prepare(page, live);
+    let calls = 0;
+    await page.route("**/api/claim/confirm", async (route) => {
+      calls += 1;
+      await route.fulfill({ status: 400, json: { error: "submission_unknown" } });
+    });
+    await page.locator("#btn-claim-confirm").click();
+    await expect(page.locator("#claim-confirm-error")).toContainText("Einreichung unklar");
+    await expect(page.locator("#btn-claim-confirm")).toBeDisabled();
+    live.claim = phase === "Submitted"
+      ? { Submitted: { txid: TXID, submitted_at_unix: 1 } }
+      : { Confirmed: { txid: TXID, block_height: 900000 } };
+    await expect(page.locator("#claim-result-status")).toHaveText(
+      phase === "Submitted" ? "Eingereicht" : "Bestätigt in Block 900000",
+    );
+    await expect(page.locator("#claim-result-txid")).toHaveText(TXID);
+    await expect(page.locator("#claim-confirm-error")).toBeEmpty();
+    expect(calls).toBe(1);
+  });
+}
+
 test("lost prepare response shows a polled preview but requires a new prepare", async ({ page }) => {
   const live = await openClaim(page);
   await page.route("**/api/claim/prepare", async (route) => {
