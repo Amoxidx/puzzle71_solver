@@ -335,6 +335,7 @@ function renderClaim(claim, hit, claimBusy) {
       if (phase !== "Submitted" && phase !== "Confirmed") byId("claim-confirm-error").textContent = CLAIM_UNKNOWN_TEXT;
     }
   }
+  if (phase === "Submitted" || phase === "Confirmed") clearClaimActionErrors();
   setHidden("claim-step-destination", !["Idle", "AwaitingOwner", "Prepared", "Failed"].includes(phase));
   setHidden("claim-step-result", !["Submitted", "Confirmed", "Failed"].includes(phase));
   if (phase === "Prepared" && fields.summary && !(claimPending && claimBusyKind === "prepare" && !claimAwaitingOutcome)) {
