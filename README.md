@@ -94,11 +94,13 @@ Alle Profile sind global auf höchstens 90 % GPU-Duty begrenzt. Nach jedem Metal
 | --- | ---: | --- |
 | `eco` | 40 % | geringere Aktivzeit, kleinere Dispatches |
 | `balanced` | 70 % | ausgewogenes Standardprofil |
-| `high` | 85 % | höhere Aktivzeit und größere Dispatches |
-| `full` | 90 % (Obergrenze) | größter Dispatch, weiterhin mit Duty-Begrenzung |
+| `high` | 85 % | höhere angeforderte GPU-Aktivzeit |
+| `full` | 90 % (Obergrenze) | höchstes Duty-Limit, weiterhin mit Leerlaufzeit |
 | `auto` | startet bei 70 % | passt sich per Systemlast und geschätzter Package-Power geglättet an |
 
 Die Power- und Temperaturwerte im Dashboard sind Schätzwerte aus Prozess-/Systemlast und einem Modell; sie sind keine Messung eines externen Wattmeters oder Temperatursensors.
+
+`BALANCED` und `AUTO` verwenden bis zu 2.097.152 Schlüssel pro Dispatch (2.048 Threads × 1.024 Schritte). Im begrenzten Vergleich auf einem Apple M4 mit festem `BALANCED`-Duty von 70 % stieg die dauerhaft verbuchte Suchrate in jeweils zwei Minuten um 18,51 %. Gegenläufige längere Messpaare ergaben 15,57 % und 16,50 %. Gleiche physische Leistungsaufnahme wurde dabei nicht nachgewiesen. Eine Pause wirkt nach dem laufenden Dispatch; im Test dauerte dies höchstens 0,227 Sekunden. Die Auto-Glättung erfolgt pro Dispatch und benötigt mit größeren Dispatches mehr Zeit.
 
 Die Status-API meldet die tatsächlich gemessene Leerlaufzeit des letzten Dispatchs; der angezeigte Dispatch-Anteil verwendet diese Messung. Das Duty-Limit bestimmt die mindestens angeforderte Pause; der macOS-Scheduler kann sie verlängern. Die Startdienst-Einstellung `ProcessType` beeinflusst diese Zeitsteuerung und weitere CPU-/I/O-Beschränkungen. `Interactive` hebt gegenüber `Standard` solche Beschränkungen auf; das konfigurierte GPU-Duty-Limit bleibt bestehen. Eine höhere Suchrate ist kein Nachweis gleicher Leistungsaufnahme.
 

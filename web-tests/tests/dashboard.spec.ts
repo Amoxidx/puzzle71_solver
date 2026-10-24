@@ -85,6 +85,11 @@ test.describe("Puzzle #71 dashboard", () => {
     await expect(progress).toContainText("1 / 3 Blöcke");
     await expect(progress).toContainText("Danach werden automatisch neue Bereiche gesucht");
     await expect(page.locator("#val-total-blocks")).toHaveText("3");
+    live.progress_available = false;
+    await expect(progress).toBeHidden();
+    await expect(page.locator("#val-total-blocks")).toHaveText("Nicht verfügbar");
+    live.progress_available = true;
+    await expect(progress).toBeVisible();
     live.recheck_progress.completed = 3;
     await expect(progress).toContainText("Nachprüfung abgeschlossen: 3 Altblöcke");
     await expect(progress).toContainText("Suche neuer Bereiche ist freigegeben");

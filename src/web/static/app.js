@@ -223,7 +223,7 @@ function updateUI(data, revision = claimRevision) {
   const recheckTotal = finiteNumber(recheck?.identity?.total_blocks);
   const recheckCompleted = finiteNumber(recheck?.completed);
   const hasRecheck = progressAvailable && recheckTotal > 0;
-  setHidden("recheck-progress", !hasRecheck);
+  byId("recheck-progress").hidden = !hasRecheck;
   if (hasRecheck) {
     setTextIfChanged(byId("recheck-progress"), recheckCompleted < recheckTotal
       ? `Altbereiche nachgeprüft: ${formatNumber(recheckCompleted)} / ${formatNumber(recheckTotal)} Blöcke. Danach werden automatisch neue Bereiche gesucht.`

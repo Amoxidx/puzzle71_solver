@@ -30,7 +30,7 @@ pub fn dispatch_profile(mode: PowerMode) -> DispatchProfile {
         },
         PowerMode::Balanced | PowerMode::Auto => DispatchProfile {
             threads: 2048,
-            steps: 128,
+            steps: 1024,
         },
         PowerMode::High => DispatchProfile {
             threads: 4096,
@@ -53,6 +53,9 @@ mod tests {
             .into_iter()
             .map(|mode| dispatch_profile(mode).batch_keys())
             .collect();
-        assert_eq!(sizes, vec![131_072, 262_144, 524_288, 1_048_576, 262_144]);
+        assert_eq!(
+            sizes,
+            vec![131_072, 2_097_152, 524_288, 1_048_576, 2_097_152]
+        );
     }
 }
