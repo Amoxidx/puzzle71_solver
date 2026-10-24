@@ -19,6 +19,7 @@ use puzzle71_solver::puzzle_config::{RANGE_MAX, RANGE_MIN, TARGET_ADDRESS, TARGE
 use puzzle71_solver::search::block_progress::BlockProgress;
 use puzzle71_solver::search::checkpoint::DEFAULT_CHECKPOINT_FILE;
 use puzzle71_solver::search::profile::dispatch_profile;
+use puzzle71_solver::search::recheck::RecheckPlan;
 use puzzle71_solver::search::rng::select_random_block_start;
 use puzzle71_solver::search::store::{CheckpointLock, CheckpointStore};
 use puzzle71_solver::ui::terminal::SolverStats;
@@ -41,6 +42,8 @@ fn main() {
         web_port,
         enable_tui,
         action,
+        recheck_source,
+        prepare_recheck_from,
     } = CliOptions::parse(env::args().skip(1)).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
@@ -73,7 +76,40 @@ fn main() {
             }
             return;
         }
+        CliAction::PrepareRecheck => {
+            let result = (|| {
+                let plan = RecheckPlan::load(
+                    recheck_source.as_ref().expect("validated source"),
+                    block_size,
+                )?;
+                let lock = CheckpointLock::acquire_recheck(DEFAULT_CHECKPOINT_FILE, &plan)?;
+                let store = CheckpointStore::initialize_recheck(
+                    lock,
+                    block_size,
+                    plan,
+                    prepare_recheck_from.expect("validated history copy"),
+                )?;
+                let progress = store.recheck_progress().expect("initialized recheck");
+                println!(
+                    "Prepared targeted recheck: {} blocks, source {}. No search started.",
+                    progress.identity.total_blocks, progress.identity.source_sha256
+                );
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = result {
+                eprintln!("Cannot prepare targeted recheck: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
     }
+
+    // Retain a source error until after verified-hit recovery. A broken history must
+    // not prevent access to a securely saved hit; it must still prevent searching.
+    let recheck_plan = recheck_source
+        .as_ref()
+        .map(|source| RecheckPlan::load(source, block_size))
+        .transpose();
 
     // Step 1: Execute mandatory CPU cryptographic and 24-bit Mini-Puzzle test
     println!("Executing mandatory cryptographic and 24-bit Mini-Puzzle self-test...");
@@ -86,11 +122,14 @@ fn main() {
     }
 
     // Protect search progress and recovered claims before either path can write.
-    let checkpoint_lock =
-        CheckpointLock::acquire(DEFAULT_CHECKPOINT_FILE).unwrap_or_else(|error| {
-            eprintln!("CRITICAL: {error}");
-            std::process::exit(1);
-        });
+    let checkpoint_lock = acquire_search_lock(
+        recheck_source.as_deref(),
+        recheck_plan.as_ref().ok().and_then(Option::as_ref),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("CRITICAL: {error}");
+        std::process::exit(1);
+    });
 
     let found_key_scan =
         find_verified_found_key(Path::new("."), TARGET_HASH160, RANGE_MIN..=RANGE_MAX);
@@ -125,10 +164,15 @@ fn main() {
     }
 
     // Step 3: Load existing checkpoint if available
-    let mut checkpoint = CheckpointStore::open(checkpoint_lock, block_size).unwrap_or_else(|e| {
-        eprintln!("CRITICAL: Refusing to ignore invalid checkpoint: {}", e);
-        std::process::exit(1);
-    });
+    let mut checkpoint = recheck_plan
+        .and_then(|plan| match plan {
+            Some(plan) => CheckpointStore::open_recheck(checkpoint_lock, block_size, plan),
+            None => CheckpointStore::open(checkpoint_lock, block_size),
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("CRITICAL: Refusing to ignore invalid checkpoint: {}", e);
+            std::process::exit(1);
+        });
     println!(
         "Loaded checkpoint: {} keys previously tested across {} blocks.",
         checkpoint.total_keys_tested(),
@@ -149,6 +193,7 @@ fn main() {
     shared_state
         .progress_available
         .store(true, Ordering::SeqCst);
+    *shared_state.recheck_progress.lock().unwrap() = checkpoint.recheck_progress();
 
     start_web_server(&web_host, web_port, shared_state.clone()).unwrap_or_else(|e| {
         eprintln!(
@@ -209,20 +254,25 @@ fn main() {
         let web_mode = *shared_state.mode.lock().unwrap();
         governor.set_mode(web_mode);
 
-        // Select a random block start aligned to block_size
-        let block_start = match select_random_block_start(block_size) {
-            Ok(k) => k,
-            Err(e) => {
-                set_fatal_error(&shared_state, format!("Secure RNG failed: {}", e));
-                terminal_state = true;
-                break 'search;
+        // Pending archived blocks bypass global dedup; once done, use the existing RNG.
+        let rechecking = checkpoint.next_recheck_block();
+        let block_start = if let Some(index) = rechecking {
+            RANGE_MIN + index as u128 * block_size
+        } else {
+            match select_random_block_start(block_size) {
+                Ok(k) => k,
+                Err(e) => {
+                    set_fatal_error(&shared_state, format!("Secure RNG failed: {}", e));
+                    terminal_state = true;
+                    break 'search;
+                }
             }
         };
 
         let block_index = ((block_start - RANGE_MIN) / block_size) as u64;
 
         // Skip if already scanned
-        if checkpoint.is_scanned(block_index) {
+        if rechecking.is_none() && checkpoint.is_scanned(block_index) {
             continue;
         }
 
@@ -388,6 +438,7 @@ fn main() {
         shared_state
             .checkpoint_saved_timestamp
             .store(checkpoint.last_saved_timestamp(), Ordering::SeqCst);
+        *shared_state.recheck_progress.lock().unwrap() = checkpoint.recheck_progress();
 
         // Render TUI periodically (every 1 second if enabled)
         if enable_tui && last_render_instant.elapsed() >= Duration::from_secs(1) {
@@ -610,6 +661,32 @@ fn persist_checkpoint(
     Ok(())
 }
 
+fn acquire_search_lock(
+    source: Option<&Path>,
+    plan: Option<&RecheckPlan>,
+) -> Result<CheckpointLock, String> {
+    if let Some(plan) = plan {
+        return CheckpointLock::acquire_recheck(DEFAULT_CHECKPOINT_FILE, plan);
+    }
+    // Even a malformed source must not be chmodded as the writer lock during hit
+    // recovery. General lock acquisition independently rejects hardlinks/symlinks.
+    if let Some(source) = source
+        && source
+            .canonicalize()
+            .ok()
+            .zip(
+                Path::new(DEFAULT_CHECKPOINT_FILE)
+                    .with_extension("lock")
+                    .canonicalize()
+                    .ok(),
+            )
+            .is_some_and(|(source, lock)| source == lock)
+    {
+        return Err("Refusing writer lock alias of recheck source".into());
+    }
+    CheckpointLock::acquire(DEFAULT_CHECKPOINT_FILE)
+}
+
 fn set_fatal_error(shared_state: &SharedSolverState, error: String) {
     eprintln!("CRITICAL: {}", error);
     shared_state.is_running.store(false, Ordering::SeqCst);
@@ -645,5 +722,9 @@ fn print_help() {
     println!("  --telegram-test                   Send one Telegram test message and exit");
     println!("  --electricity-price <EUR/kWh>     Configure electricity cost (default: 0.34)");
     println!("  --block-size <keys>               Divisor of 2^70 yielding at most 2^64-1 blocks");
+    println!("  --recheck-source <archive.json>    Resume a prepared, source-bound legacy recheck");
+    println!(
+        "  --prepare-recheck-from <copy.json> Initialize a fresh scope from a stopped history copy"
+    );
     println!("  --help, -h                        Show this help message");
 }

@@ -219,6 +219,16 @@ function updateUI(data, revision = claimRevision) {
   setTextIfChanged(byId("history-note"), progressAvailable
     ? "Übernommene Einträge wurden nicht automatisch rückwirkend nachgeprüft."
     : "Suchhistorie beim Trefferstart nicht verfügbar; der leere Wert bedeutet nicht null.");
+  const recheck = data.recheck_progress;
+  const recheckTotal = finiteNumber(recheck?.identity?.total_blocks);
+  const recheckCompleted = finiteNumber(recheck?.completed);
+  const hasRecheck = progressAvailable && recheckTotal > 0;
+  setHidden("recheck-progress", !hasRecheck);
+  if (hasRecheck) {
+    setTextIfChanged(byId("recheck-progress"), recheckCompleted < recheckTotal
+      ? `Altbereiche nachgeprüft: ${formatNumber(recheckCompleted)} / ${formatNumber(recheckTotal)} Blöcke. Danach werden automatisch neue Bereiche gesucht.`
+      : `Nachprüfung abgeschlossen: ${formatNumber(recheckTotal)} Altblöcke. Suche neuer Bereiche ist freigegeben.`);
+  }
 
   const runtime = finiteNumber(data.runtime_secs);
   const kwhProjected = watts * runtime / 3_600_000;

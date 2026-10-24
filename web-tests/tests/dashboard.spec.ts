@@ -68,6 +68,30 @@ async function gotoDashboard(page: Page): Promise<void> {
 }
 
 test.describe("Puzzle #71 dashboard", () => {
+  test("legacy recheck progress distinguishes pending, completed and absent scopes", async ({ page }) => {
+    const live = {
+      is_running: false, mode: "BALANCED", progress_available: true,
+      total_keys_tested: "50331648", total_blocks_tested: 3, runtime_secs: 10,
+      current_keys_per_sec: 0, avg_keys_per_sec: 0, target_gpu_duty_pct: 70,
+      last_error: null, hit: null, claim: null, claim_busy: false,
+      recheck_progress: null as { completed: number; identity: { total_blocks: number } } | null,
+    };
+    await page.route("**/api/status", (route) => route.fulfill({ json: live }));
+    await gotoDashboard(page);
+    const progress = page.locator("#recheck-progress");
+    await expect(progress).toBeHidden();
+    live.recheck_progress = { completed: 1, identity: { total_blocks: 3 } };
+    await expect(progress).toBeVisible();
+    await expect(progress).toContainText("1 / 3 Blöcke");
+    await expect(progress).toContainText("Danach werden automatisch neue Bereiche gesucht");
+    await expect(page.locator("#val-total-blocks")).toHaveText("3");
+    live.recheck_progress.completed = 3;
+    await expect(progress).toContainText("Nachprüfung abgeschlossen: 3 Altblöcke");
+    await expect(progress).toContainText("Suche neuer Bereiche ist freigegeben");
+    live.recheck_progress = null;
+    await expect(progress).toBeHidden();
+  });
+
   test("unavailable restored progress is shown as unavailable rather than zero", async ({ page }) => {
     await page.route("**/api/status", (route) => route.fulfill({ json: {
       is_running: false, mode: "HIGH", progress_available: false,
@@ -166,6 +190,11 @@ test.describe("Puzzle #71 dashboard", () => {
   });
 
   test("reduced-motion rules independently stop the status pulse and pressed-button movement", async ({ page }) => {
+    let interceptedStops = 0;
+    await page.route("**/api/stop", (route) => {
+      interceptedStops += 1;
+      return route.fulfill({ json: { status: "stopped" } });
+    });
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.route("**/api/status", (route) => route.fulfill({ json: {
       is_running: true, mode: "HIGH", total_keys_tested: "0", total_blocks_tested: 0,
@@ -181,6 +210,7 @@ test.describe("Puzzle #71 dashboard", () => {
     await page.mouse.down();
     await expect(button).toHaveCSS("transform", "none");
     await page.mouse.up();
+    await expect.poll(() => interceptedStops).toBe(1);
   });
 
   test("power model is unavailable before the first GPU dispatch", async ({ page }) => {

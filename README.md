@@ -59,6 +59,8 @@ Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtend
 --telegram-test                      Telegram-Testnachricht senden und beenden
 --electricity-price <EUR/kWh>         Kostenparameter für die Anzeige, Standard: 0.34
 --block-size <keys>                   Teiler von 2^70 für die Suchblöcke
+--recheck-source <archive.json>        Gebundene Nachprüfung eines alten Checkpoints fortsetzen
+--prepare-recheck-from <copy.json>     Neuen Nachprüfungsstand aus einer angehaltenen Historienkopie vorbereiten
 --help, -h                            Hilfe anzeigen
 ```
 
@@ -108,7 +110,20 @@ Ein vollständiger JSON-Snapshot wird stündlich oder bei einem Journal von mind
 
 Beim Start werden Puzzle, Suchbereich, Blockgröße, Zähler und Journal-Prüfsummen validiert. Bereits übernommene Journal-Blöcke werden nicht doppelt gezählt. Ein unvollständiger letzter Datensatz wird konservativ entfernt; vollständige beschädigte Datensätze führen zu einem Fehler. Ein laufender Block wird erst nach vollständigem Abschluss dauerhaft als abgedeckt markiert.
 
-Ein übernommener alter Checkpoint belegt weiterhin nur die damals gezählte Suchhistorie. Die korrigierte Metal-Feldarithmetik prüft diese früheren Kandidaten nicht rückwirkend erneut. Für eine vollständige erneute Prüfung ein frisches Arbeitsverzeichnis verwenden und die bisherige Historie getrennt sichern.
+Ein übernommener alter Checkpoint belegt weiterhin nur die damals gezählte Suchhistorie. Die korrigierte Metal-Feldarithmetik prüft diese früheren Kandidaten nicht automatisch rückwirkend erneut. Für eine gezielte Nachprüfung wird ein neuer, an das genaue Archiv gebundener Arbeitsstand vorbereitet. Er prüft dessen Blöcke trotz bestehender globaler Einträge erneut und zählt sie dabei nicht nochmals als neue Abdeckung. Erst vollständig berechnete und synchronisierte Blöcke erhöhen den getrennten Nachprüfungszähler. Danach geht derselbe Arbeitsstand automatisch zur zufälligen Suche neuer Bereiche über.
+
+Vorbereitung: Den laufenden Solver kontrolliert beenden, Snapshot **und** Journal gemeinsam in ein eigenes privates Kopieverzeichnis sichern und das unveränderte alte Archiv getrennt erhalten. Im folgenden Beispiel sind alle Pfade absolute Pfade; das aktuelle Verzeichnis `recheck-run` muss frisch sein. Die Blockgröße muss zur kopierten Historie und zum Archiv passen.
+
+```sh
+mkdir -m 700 recheck-run
+cd recheck-run
+/pfad/zum/puzzle71_solver --recheck-source /pfad/zum/legacy_source.json --prepare-recheck-from /pfad/zur/historienkopie/puzzle71_checkpoint.json --block-size 16777216
+/pfad/zum/puzzle71_solver --recheck-source /pfad/zum/legacy_source.json --block-size 16777216 --mode balanced
+```
+
+Die Vorbereitung startet weder GPU-Suche noch Auszahlung. Sie verlangt vorhandene, gültige Snapshot-/Journalkopien und lehnt bereits vorhandene Zieldateien ab. Archive mit fehlenden Blöcken in der kopierten globalen Historie werden abgelehnt. Das Archiv wird nur gelesen; keine Produktionsdatei als Historienkopie angeben. Die Nachprüfung bindet genaue Archivbytes, Blockgröße, Puzzlebereich, Ziel-HASH160 und eingebetteten Kernel. Eine abweichende Quelle oder ein ungekennzeichneter Arbeitsstand startet keine frische Suche.
+
+Für die Wiederaufnahme gehören das unveränderte Archiv, der neue Snapshot und sein Journal zusammen. Die Oberfläche zeigt gezählte globale Historie und Nachprüfungsfortschritt getrennt. Nachprüfungsstände verwenden einen ausdrücklich versionierten Wrapper; ältere Programme können sie nicht laden. Bei einem Rückbau müssen deshalb auch Startargumente und Arbeitsverzeichnis zum jeweiligen Programmstand passen. Einen bestehenden aktuellen Arbeitsstand weiter sichern; ihn nicht durch eine alte Kopie ersetzen.
 
 ## Trefferverhalten und Geheimnisse
 
