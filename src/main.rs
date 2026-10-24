@@ -370,9 +370,11 @@ fn main() {
 
                     let metrics = governor.update();
                     let throttle_sleep = governor.required_idle_duration(outcome.gpu_duration);
+                    let throttle_started = Instant::now();
                     if throttle_sleep > Duration::ZERO {
                         thread::sleep(throttle_sleep);
                     }
+                    let actual_throttle_sleep = throttle_started.elapsed();
 
                     let cycle_elapsed = cycle_started.elapsed();
                     active_runtime_session += cycle_elapsed;
@@ -394,7 +396,7 @@ fn main() {
                     *shared_state.last_gpu_active_ms.lock().unwrap() =
                         outcome.gpu_duration.as_secs_f64() * 1000.0;
                     *shared_state.last_throttle_sleep_ms.lock().unwrap() =
-                        throttle_sleep.as_secs_f64() * 1000.0;
+                        actual_throttle_sleep.as_secs_f64() * 1000.0;
                 }
                 Err(error) => {
                     set_fatal_error(&shared_state, format!("Metal dispatch failed: {}", error));

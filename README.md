@@ -16,6 +16,8 @@ Das ist ein Brute-Force-Suchprogramm, keine Ertrags- oder Gewinnzusage. Ein Tref
 
 Der Hauptsuchlauf benötigt ein erfolgreich initialisiertes Metal-Gerät. Der CPU-Code dient unter anderem der Kryptografie, dem Mini-Puzzle-Selbsttest und der unabhängigen Trefferprüfung; ein CPU-Fallback für die vollständige Suche ist nicht implementiert.
 
+Der GPU-Kernel verarbeitet je Thread bis zu 16 aufeinanderfolgende Punkte gemeinsam. Eine Montgomery-Batch-Inversion ersetzt dabei die einzelne Feldinversion pro Kandidat. Teilbatches, ungültige Infinity-Punkte und die exakte Anzahl gültiger Schlüssel werden berücksichtigt; Suchbereich und Auswahl der Zufallsblöcke bleiben gleich.
+
 ## Auszahlung an deine Wallet
 
 Nach einem verifizierten und dauerhaft lokal gespeicherten Treffer gibst du im Dashboard die Empfangsadresse deiner Bitcoin-Wallet ein. „Adresse prüfen“ lädt aktuelle UTXOs aus zwei unabhängigen Quellen und zeigt die vollständige Zieladresse, Auszahlung und Gebühr. Erst „Transaktion an MARA Slipstream senden“ reicht genau diese Vorschau ein. Es gibt keinen Telegram-Code und keine Hardware-Wallet-Pflicht. Eine Eingabe, Vorbereitung oder ein Neustart sendet keine Transaktion.
@@ -95,6 +97,8 @@ Alle Profile sind global auf höchstens 90 % GPU-Duty begrenzt. Nach jedem Metal
 | `auto` | startet bei 70 % | passt sich per Systemlast und geschätzter Package-Power geglättet an |
 
 Die Power- und Temperaturwerte im Dashboard sind Schätzwerte aus Prozess-/Systemlast und einem Modell; sie sind keine Messung eines externen Wattmeters oder Temperatursensors.
+
+Die angezeigte Leerlaufzeit des letzten Dispatchs wird tatsächlich gemessen. Das Duty-Limit bestimmt die mindestens angeforderte Pause; der macOS-Scheduler kann sie verlängern. Die Startdienst-Einstellung `ProcessType` beeinflusst diese Zeitsteuerung und weitere CPU-/I/O-Beschränkungen. `Interactive` hebt gegenüber `Standard` solche Beschränkungen auf; das konfigurierte GPU-Duty-Limit bleibt bestehen. Eine höhere Suchrate ist kein Nachweis gleicher Leistungsaufnahme.
 
 ## Checkpoints und Fortsetzen
 
