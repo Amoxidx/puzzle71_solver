@@ -26,6 +26,7 @@ pub struct VerifiedHit {
     staged_path: Option<PathBuf>,
     staged_complete: bool,
     installed_path: Option<PathBuf>,
+    recovered_content: Option<SensitiveText>,
 }
 
 impl fmt::Debug for VerifiedHit {
@@ -57,6 +58,9 @@ impl VerifiedHit {
     }
 
     fn content(&self) -> SensitiveText {
+        if let Some(content) = self.recovered_content.as_ref() {
+            return SensitiveText(content.0.clone());
+        }
         SensitiveText(
             format!(
                 "CONFIDENTIAL PRIVATE KEY - DO NOT UPLOAD OR SHARE\n\
@@ -76,6 +80,23 @@ impl VerifiedHit {
         )
     }
 
+    fn validate_record(&self, file: &mut File) -> Result<(), String> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("Cannot inspect retained hit record: {error}"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err("Retained hit record is not an owner-only regular file".to_string());
+        }
+        let mut bytes = SensitiveText(Vec::new());
+        file.take(MAX_KEY_FILE_BYTES + 1)
+            .read_to_end(&mut bytes.0)
+            .map_err(|error| format!("Cannot verify retained hit record: {error}"))?;
+        if bytes.0 != self.content().0 {
+            return Err("Hit record no longer matches the retained candidate".to_string());
+        }
+        Ok(())
+    }
+
     fn ensure_staged(
         &mut self,
         preferred: &Path,
@@ -83,10 +104,9 @@ impl VerifiedHit {
     ) -> Result<(), String> {
         if self.staged_complete {
             let path = self.staged_path.as_ref().expect("complete staging path");
-            let file = match OpenOptions::new()
+            let mut file = match OpenOptions::new()
                 .read(true)
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(path)
             {
                 Ok(file) => file,
@@ -99,6 +119,7 @@ impl VerifiedHit {
                     return Err(format!("Cannot reopen verified hit staging file: {error}"));
                 }
             };
+            self.validate_record(&mut file)?;
             // A complete record recovered from page cache is not yet proof of durable bytes.
             sync_file(&file)
                 .map_err(|error| format!("Cannot synchronize recovered hit: {error}"))?;
@@ -140,7 +161,7 @@ impl VerifiedHit {
         let mut file = match OpenOptions::new()
             .write(true)
             .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
         {
             Ok(file) => file,
@@ -169,6 +190,25 @@ impl VerifiedHit {
         preferred: &Path,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<PathBuf, String> {
+        if let Some(installed) = self.installed_path.as_ref() {
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(installed)
+            {
+                Ok(mut file) => {
+                    self.validate_record(&mut file)?;
+                    sync_file(&file)
+                        .map_err(|error| format!("Cannot synchronize installed hit: {error}"))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A prior link succeeded, but its directory sync/cleanup did not finish.
+                    // Never discard the staging link based only on that remembered pathname.
+                    self.installed_path = None;
+                }
+                Err(error) => return Err(format!("Cannot reopen installed hit: {error}")),
+            }
+        }
         if self.installed_path.is_none() {
             self.ensure_staged(preferred, sync_file)?;
             let staged = self.staged_path.as_ref().expect("completed staging file");
@@ -240,6 +280,7 @@ fn verify_for_target(
         staged_path: None,
         staged_complete: false,
         installed_path: None,
+        recovered_content: None,
     })
 }
 
@@ -268,7 +309,7 @@ fn recover_for_target(
     for path in paths {
         let Ok(file) = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
         else {
             continue;
@@ -316,6 +357,8 @@ fn recover_for_target(
         };
         hit.staged_path = Some(path);
         hit.staged_complete = true;
+        // Keep the exact verified record, including its original timestamp, across retries.
+        hit.recovered_content = Some(content);
         return Ok(Some(hit));
     }
     Ok(None)
@@ -421,6 +464,28 @@ mod tests {
     }
 
     #[test]
+    fn recovered_original_record_survives_an_installed_link_retry() {
+        let dir = temp_dir("recovered-installed-retry");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut original = fixture();
+        original.timestamp_unix = 1;
+        original.ensure_staged(&path, File::sync_all).unwrap();
+        let staged = original.staged_path.clone().unwrap();
+        let original_bytes = SensitiveText(std::fs::read(&staged).unwrap());
+        drop(original);
+        let mut recovered = recover_for_target(&dir, ADDRESS, HASH, 1..=1)
+            .unwrap()
+            .unwrap();
+        std::fs::hard_link(&staged, &path).unwrap();
+        recovered.installed_path = Some(path.clone());
+        assert_eq!(recovered.persist(&path).unwrap(), path);
+        assert!(std::fs::read(&path).unwrap() == original_bytes.0);
+        assert!(!staged.exists());
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn retained_hit_recreates_a_disappeared_complete_staging_file() {
         let dir = temp_dir("restage");
         let path = dir.join(FOUND_KEY_FILENAME);
@@ -431,6 +496,175 @@ mod tests {
         crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn installed_retry_fixture(dir: &Path) -> (VerifiedHit, PathBuf, PathBuf) {
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut hit = fixture();
+        hit.ensure_staged(&path, File::sync_all).unwrap();
+        let staged = hit.staged_path.clone().unwrap();
+        std::fs::hard_link(&staged, &path).unwrap();
+        // State retained after installation succeeds but directory synchronization fails.
+        hit.installed_path = Some(path.clone());
+        (hit, path, staged)
+    }
+
+    #[test]
+    fn complete_staging_replacement_is_rejected_without_installing_foreign_bytes() {
+        let dir = temp_dir("replaced-staging");
+        let path = dir.join(FOUND_KEY_FILENAME);
+        let mut hit = fixture();
+        hit.ensure_staged(&path, File::sync_all).unwrap();
+        let staged = hit.staged_path.clone().unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&staged, b"unrelated replacement").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(hit.persist(&path).is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"unrelated replacement");
+        std::fs::remove_file(&staged).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_reinstalls_a_disappeared_final_link_before_removing_staging() {
+        let dir = temp_dir("missing-installed");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_recreates_both_disappeared_links_from_the_retained_key() {
+        let dir = temp_dir("missing-both-links");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_rejects_replaced_final_bytes_and_preserves_the_valid_staging_link() {
+        let dir = temp_dir("replaced-installed");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"unrelated replacement").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(hit.persist(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unrelated replacement");
+        crate::claim::ClaimKey::load_found_key_file(&staged, HASH, 1..=1).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_rejects_a_final_symlink_even_when_it_targets_valid_staging_bytes() {
+        let dir = temp_dir("symlink-installed");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&staged, &path).unwrap();
+        assert!(hit.persist(&path).is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        crate::claim::ClaimKey::load_found_key_file(&staged, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_requires_installed_file_sync_before_removing_staging() {
+        let dir = temp_dir("installed-sync");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        assert!(
+            hit.persist_with_file_sync(&path, |_| {
+                Err(std::io::Error::other(
+                    "injected installed-file sync failure",
+                ))
+            })
+            .is_err()
+        );
+        crate::claim::ClaimKey::load_found_key_file(&staged, HASH, 1..=1).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        assert!(!staged.exists());
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_rejects_public_installed_permissions_without_removing_staging() {
+        let dir = temp_dir("installed-mode");
+        let (mut hit, path, staged) = installed_retry_fixture(&dir);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(hit.persist(&path).is_err());
+        assert!(staged.exists());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(hit.persist(&path).unwrap(), path);
+        crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replaced_fifo_does_not_block_installation_retry_or_staging_recovery() {
+        const CHILD_MODE: &str = "PUZZLE71_FIFO_TEST_CHILD";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = temp_dir("fifo");
+            let (mut hit, path, staged) = installed_retry_fixture(&dir);
+            let target = if mode == "staging" { &staged } else { &path };
+            std::fs::remove_file(target).unwrap();
+            let cpath = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+            // SAFETY: cpath is a valid, NUL-terminated pathname in our private fixture directory.
+            assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+            if mode == "installed" {
+                assert!(hit.persist(&path).is_err());
+                assert!(staged.exists());
+            } else if mode == "staging" {
+                assert!(
+                    recover_for_target(&dir, ADDRESS, HASH, 1..=1)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(crate::claim::ClaimKey::load_found_key_file(&path, HASH, 1..=1).is_err());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        for mode in ["installed", "staging", "claim"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hit_handler::tests::replaced_fifo_does_not_block_installation_retry_or_staging_recovery"])
+                .env(CHILD_MODE, mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "{mode} FIFO was not safely rejected");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{mode} FIFO blocked the hit persistence/recovery path");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

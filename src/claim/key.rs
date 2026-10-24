@@ -6,8 +6,9 @@
 //! (secp256k1-0.29.1/src/key.rs:972, macro at src/macros.rs:56-70).
 
 use std::fmt;
+use std::io::Read;
 use std::ops::RangeInclusive;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use bitcoin::hashes::Hash;
@@ -17,6 +18,7 @@ use crate::claim::error::ClaimError;
 use crate::claim::memory::secure_zero;
 
 const FOUND_KEY_LABEL: &str = "PRIVATE KEY (HEX):";
+const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
 
 /// An independently derived, target-matching private key for the puzzle address.
 ///
@@ -69,20 +71,41 @@ impl ClaimKey {
         expected_hash160: [u8; 20],
         range: RangeInclusive<u128>,
     ) -> Result<ClaimKey, ClaimError> {
-        let metadata = std::fs::metadata(path).map_err(|_| ClaimError::KeyFileFormat)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| ClaimError::KeyFileFormat)?;
+        let metadata = file.metadata().map_err(|_| ClaimError::KeyFileFormat)?;
+        if !metadata.is_file() || metadata.len() > MAX_KEY_FILE_BYTES {
+            return Err(ClaimError::KeyFileFormat);
+        }
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Err(ClaimError::KeyFilePermissions);
         }
 
-        let content = std::fs::read_to_string(path).map_err(|_| ClaimError::KeyFileFormat)?;
+        let mut content = Vec::new();
+        if file
+            .take(MAX_KEY_FILE_BYTES + 1)
+            .read_to_end(&mut content)
+            .is_err()
+            || content.len() as u64 > MAX_KEY_FILE_BYTES
+        {
+            secure_zero(&mut content);
+            return Err(ClaimError::KeyFileFormat);
+        }
+        let Ok(text) = std::str::from_utf8(&content) else {
+            secure_zero(&mut content);
+            return Err(ClaimError::KeyFileFormat);
+        };
         let mut found: Option<u128> = None;
         // Collected instead of returned early from inside the loop so that every path below —
         // success or a malformed line partway through the file — still reaches the
-        // `secure_zero(&mut content_bytes)` call right after the loop; `content` holds the raw
+        // `secure_zero(&mut content)` call right after the loop; `content` holds the raw
         // file text, including the key hex, until then.
         let mut parse_result: Result<(), ClaimError> = Ok(());
-        for line in content.lines() {
+        for line in text.lines() {
             let Some(rest) = line.trim().strip_prefix(FOUND_KEY_LABEL) else {
                 continue;
             };
@@ -105,8 +128,7 @@ impl ClaimKey {
 
         // Best effort (see `memory.rs`): erase the file's raw text, which contains the key hex,
         // on every path from here on, not only the success path.
-        let mut content_bytes = content.into_bytes();
-        secure_zero(&mut content_bytes);
+        secure_zero(&mut content);
 
         parse_result?;
         let key = found.ok_or(ClaimError::KeyFileFormat)?;
@@ -223,6 +245,34 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn load_found_key_file_rejects_a_symlink_to_a_valid_private_record() {
+        let dir = temp_dir("symlink");
+        let path = dir.join("FOUND_KEY.txt");
+        let record = dir.join("record");
+        write_key_file(
+            &record,
+            0o600,
+            &format!("PRIVATE KEY (HEX): 0x{TEST_SCALAR:x}\n"),
+        );
+        std::os::unix::fs::symlink(&record, &path).unwrap();
+        assert!(ClaimKey::load_found_key_file(&path, test_hash160(), 0..=u128::MAX).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_found_key_file_rejects_an_oversized_otherwise_valid_record() {
+        let dir = temp_dir("oversized");
+        let path = dir.join("FOUND_KEY.txt");
+        let content = format!(
+            "PRIVATE KEY (HEX): 0x{TEST_SCALAR:x}\n{}",
+            " ".repeat(16 * 1024)
+        );
+        write_key_file(&path, 0o600, &content);
+        assert!(ClaimKey::load_found_key_file(&path, test_hash160(), 0..=u128::MAX).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
