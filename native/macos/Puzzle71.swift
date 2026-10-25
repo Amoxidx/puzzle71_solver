@@ -232,7 +232,16 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
     fileprivate let root: DashboardRootView
     #if PUZZLE71_TESTING
     fileprivate var testNavigationResult: Result<Void, Error>?
+    fileprivate var testDashboardURL: URL?
+    fileprivate var testUsesProductionLoadFailure = false
     #endif
+
+    private var configuredDashboardURL: URL {
+        #if PUZZLE71_TESTING
+        if let testDashboardURL { return testDashboardURL }
+        #endif
+        return Self.dashboardURL
+    }
 
     override init() {
         let root = DashboardRootView(frame: .zero)
@@ -298,7 +307,11 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
 
     func show() {
         presentChromeWithoutLoading()
-        webView.load(URLRequest(url: Self.dashboardURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8))
+        loadDashboard()
+    }
+
+    fileprivate func loadDashboard() {
+        webView.load(URLRequest(url: configuredDashboardURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8))
     }
 
     func webView(
@@ -307,7 +320,7 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
         preferences: WKWebpagePreferences,
         decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
-        if Self.isAllowedURL(navigationAction.request.url) {
+        if allowsNavigation(navigationAction.request.url) {
             decisionHandler(.allow, preferences)
         } else {
             decisionHandler(.cancel, preferences)
@@ -323,7 +336,7 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
             decisionHandler(.allow)
             return
         }
-        if Self.isAllowedURL(url) {
+        if allowsNavigation(url) {
             decisionHandler(.allow)
         } else {
             decisionHandler(.cancel)
@@ -342,7 +355,7 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
         #if PUZZLE71_TESTING
         if testNavigationResult == nil {
             testNavigationResult = .failure(error)
-            return
+            if !testUsesProductionLoadFailure { return }
         }
         #endif
         presentLoadFailure(error)
@@ -352,7 +365,7 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
         #if PUZZLE71_TESTING
         if testNavigationResult == nil {
             testNavigationResult = .failure(error)
-            return
+            if !testUsesProductionLoadFailure { return }
         }
         #endif
         presentLoadFailure(error)
@@ -368,7 +381,7 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
         for navigationAction: WKNavigationAction,
         windowFeatures _: WKWindowFeatures
     ) -> WKWebView? {
-        if Self.isAllowedURL(navigationAction.request.url) {
+        if allowsNavigation(navigationAction.request.url) {
             webView.load(navigationAction.request)
         }
         return nil
@@ -381,6 +394,7 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
         }
 
         let detail = htmlEscaped(nsError.localizedDescription)
+        let endpoint = htmlEscaped(configuredDashboardURL.absoluteString)
         let html = """
         <!DOCTYPE html>
         <html lang="de">
@@ -404,14 +418,26 @@ private final class DashboardSession: NSObject, WKNavigationDelegate, WKUIDelega
         <body>
           <main>
             <h1>Lokales Dashboard nicht erreichbar</h1>
-            <p>Die App konnte <code>http://127.0.0.1:8080</code> nicht laden. Der Puzzle-#71-Solver muss lokal laufen, bevor dieses Fenster Inhalt anzeigen kann.</p>
+            <p>Die App konnte <code>\(endpoint)</code> nicht laden. Der Puzzle-#71-Solver muss lokal laufen, bevor dieses Fenster Inhalt anzeigen kann.</p>
             <p>Fehler: \(detail)</p>
-            <p><a href="http://127.0.0.1:8080">Erneut versuchen</a></p>
+            <p><a href="\(endpoint)">Erneut versuchen</a></p>
           </main>
         </body>
         </html>
         """
         webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    fileprivate func allowsNavigation(_ url: URL?) -> Bool {
+        #if PUZZLE71_TESTING
+        if let testDashboardURL {
+            guard let url else { return false }
+            if url.scheme?.lowercased() == "about" { return true }
+            return url.scheme == "http" && url.host == Self.dashboardHost
+                && url.port == testDashboardURL.port && url.user == nil && url.password == nil
+        }
+        #endif
+        return Self.isAllowedURL(url)
     }
 
     private static func isAllowedURL(_ url: URL?) -> Bool {
@@ -531,6 +557,42 @@ enum Puzzle71TestHooks {
         created.presentChromeWithoutLoading()
         session = created
         return (created.window, created.root)
+    }
+
+    static func validateRegtestEndpoint(_ raw: String) throws -> URL {
+        guard let components = URLComponents(string: raw),
+              components.scheme == "http", components.host == "127.0.0.1",
+              let port = components.port, (1024...65535).contains(port), port != 8080,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              raw == "http://127.0.0.1:\(port)" || raw == "http://127.0.0.1:\(port)/",
+              let url = components.url else {
+            throw NSError(domain: "Puzzle71TestHooks", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "regtest endpoint must be a canonical HTTP loopback root on a high port other than 8080"])
+        }
+        return url
+    }
+
+    static func makeUnloadedRegtestChrome(endpoint: String) throws -> (window: NSWindow, root: DashboardRootView) {
+        let url = try validateRegtestEndpoint(endpoint)
+        let created = DashboardSession()
+        created.testDashboardURL = url
+        created.testUsesProductionLoadFailure = true
+        created.presentChromeWithoutLoading()
+        session = created
+        return (created.window, created.root)
+    }
+
+    static func loadDashboard() throws {
+        guard let session else {
+            throw NSError(domain: "Puzzle71TestHooks", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "chrome session was not created"])
+        }
+        session.loadDashboard()
+    }
+
+    static func allowsNavigation(_ url: URL?) -> Bool {
+        session?.allowsNavigation(url) ?? false
     }
 
     static func loadCSPFixtureAndReadMargin(timeout: TimeInterval) throws -> String {

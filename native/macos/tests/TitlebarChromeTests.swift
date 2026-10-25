@@ -78,6 +78,49 @@ enum TitlebarChromeTests {
             check(false, "CSP fixture navigation/evaluation failed: \(error.localizedDescription)")
         }
 
+        check(Puzzle71TestHooks.allowsNavigation(URL(string: "http://127.0.0.1:8080/")), "default session retains the production endpoint")
+        check(!Puzzle71TestHooks.allowsNavigation(URL(string: "http://127.0.0.1:18080/")), "default session rejects a test port")
+        for raw in ["http://127.0.0.1:1024", "http://127.0.0.1:18080/", "http://127.0.0.1:65535"] {
+            do {
+                let url = try Puzzle71TestHooks.validateRegtestEndpoint(raw)
+                check(url.absoluteString == raw, "valid test endpoint remains exact: \(raw)")
+            } catch {
+                check(false, "valid test endpoint rejected: \(raw)")
+            }
+        }
+        for raw in [
+            "http://127.0.0.1:8080", "http://127.0.0.1:80", "http://127.0.0.1:1023",
+            "http://127.0.0.1:65536", "http://127.0.0.1", "http://localhost:18080",
+            "http://[::1]:18080", "http://192.0.2.1:18080", "https://127.0.0.1:18080",
+            "file:///tmp/test", "http://user@127.0.0.1:18080", "http://user:pass@127.0.0.1:18080",
+            "http://127.0.0.1:18080?", "http://127.0.0.1:18080#", "http://127.0.0.1:18080/api/status",
+            "http://127.0.0.1:018080", "HTTP://127.0.0.1:18080", " http://127.0.0.1:18080",
+        ] {
+            do {
+                _ = try Puzzle71TestHooks.validateRegtestEndpoint(raw)
+                check(false, "unsafe/noncanonical test endpoint accepted: \(raw)")
+            } catch {
+                check(true, "unsafe test endpoint rejected")
+            }
+        }
+        window.close()
+        Puzzle71TestHooks.tearDown()
+        do {
+            let testChrome = try Puzzle71TestHooks.makeUnloadedRegtestChrome(endpoint: "http://127.0.0.1:18080")
+            defer { testChrome.window.close(); Puzzle71TestHooks.tearDown() }
+            check(Puzzle71TestHooks.allowsNavigation(URL(string: "http://127.0.0.1:18080/")), "test session permits its exact endpoint")
+            check(Puzzle71TestHooks.allowsNavigation(URL(string: "http://127.0.0.1:18080/app.js")), "test session retains same-origin paths")
+            check(Puzzle71TestHooks.allowsNavigation(URL(string: "about:blank")), "native failure document remains allowed")
+            for raw in ["http://127.0.0.1:8080/", "http://127.0.0.1:18081/", "https://127.0.0.1:18080/",
+                        "http://localhost:18080/", "http://192.0.2.1:18080/", "file:///tmp/test",
+                        "http://user@127.0.0.1:18080/"] {
+                check(!Puzzle71TestHooks.allowsNavigation(URL(string: raw)), "test navigation rejects \(raw)")
+            }
+            check(!Puzzle71TestHooks.allowsNavigation(nil), "nil navigation is rejected")
+        } catch {
+            check(false, "unloaded regtest session failed: \(error.localizedDescription)")
+        }
+
         if failures > 0 {
             fputs("\(failures) assertion(s) failed\n", stderr)
             exit(1)
