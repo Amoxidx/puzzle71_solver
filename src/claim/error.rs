@@ -49,6 +49,8 @@ pub enum ClaimError {
     /// The computed (or claimed) output value falls below the destination script's dust
     /// threshold, or the fee alone would consume the entire input value.
     OutputBelowDust,
+    /// The claim would exceed the absolute consensus block-weight limit.
+    TransactionTooLarge,
     /// The transaction does not have exactly one output.
     OutputCount,
     /// The transaction's single output script does not match the destination's script.
@@ -100,6 +102,7 @@ impl fmt::Display for ClaimError {
             ClaimError::FeeRateOutOfBounds => "fee rate is outside the allowed bounds",
             ClaimError::NoEconomicInputs => "no prevout is economic to spend at this fee rate",
             ClaimError::OutputBelowDust => "output value is below the dust threshold",
+            ClaimError::TransactionTooLarge => "claim exceeds the consensus weight limit",
             ClaimError::OutputCount => "transaction does not have exactly one output",
             ClaimError::OutputScriptMismatch => "output script does not match destination",
             ClaimError::InputSetMismatch => "input outpoint set does not match economic prevouts",

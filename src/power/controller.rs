@@ -28,6 +28,15 @@ impl std::str::FromStr for PowerMode {
 }
 
 impl PowerMode {
+    pub fn initial_duty_cycle(self) -> f32 {
+        match self {
+            Self::Eco => 0.40,
+            Self::Balanced | Self::Auto => 0.70,
+            Self::High => 0.85,
+            Self::Full => MAX_GPU_DUTY_CYCLE,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Eco => "ECO",
@@ -83,13 +92,13 @@ impl PowerGovernor {
     }
 
     fn mode_targets(mode: PowerMode) -> (f32, f32) {
-        match mode {
-            PowerMode::Eco => (0.40, 15.0),
-            PowerMode::Balanced => (0.70, 22.0),
-            PowerMode::High => (0.85, 26.0),
-            PowerMode::Full => (MAX_GPU_DUTY_CYCLE, 28.0),
-            PowerMode::Auto => (0.70, 22.0),
-        }
+        let watts = match mode {
+            PowerMode::Eco => 15.0,
+            PowerMode::Balanced | PowerMode::Auto => 22.0,
+            PowerMode::High => 26.0,
+            PowerMode::Full => 28.0,
+        };
+        (mode.initial_duty_cycle(), watts)
     }
 
     /// Update power governor state based on recent system activity and mode
@@ -97,18 +106,6 @@ impl PowerGovernor {
         let metrics = self.monitor.sample(self.current_duty_cycle);
 
         match self.mode {
-            PowerMode::Eco => {
-                self.current_duty_cycle = 0.40;
-            }
-            PowerMode::Balanced => {
-                self.current_duty_cycle = 0.70;
-            }
-            PowerMode::High => {
-                self.current_duty_cycle = 0.85;
-            }
-            PowerMode::Full => {
-                self.current_duty_cycle = MAX_GPU_DUTY_CYCLE;
-            }
             PowerMode::Auto => {
                 // In AUTO mode: Adjust duty cycle dynamically based on background load
                 // If system load > 2.0 (other apps working), smoothly reduce duty cycle
@@ -130,6 +127,7 @@ impl PowerGovernor {
                 self.current_duty_cycle = self.current_duty_cycle * (1.0 - self.smoothing_factor)
                     + desired_duty * self.smoothing_factor;
             }
+            mode => self.current_duty_cycle = mode.initial_duty_cycle(),
         }
 
         self.current_duty_cycle = self.current_duty_cycle.min(MAX_GPU_DUTY_CYCLE);

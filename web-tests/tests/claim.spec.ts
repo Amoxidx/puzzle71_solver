@@ -7,7 +7,7 @@ const TXID_B = "b".repeat(64);
 const HIT = { bitcoin_address: "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU", saved_filename: "FOUND_KEY.txt", timestamp_unix: 1, storage_pending: false };
 const SUMMARY = { network: "bitcoin", destination: DESTINATION, input_count: 3, total_input_sat: 710000000, output_sat: 709400000, fee_sat: 600000, vsize: 300, effective_fee_rate_sat_vb: 2000, txid: TXID, excluded_dust_count: 55, excluded_dust_sat: 184686 };
 type Summary = typeof SUMMARY;
-type LiveStatus = { claim: unknown; hit: unknown; claim_busy: boolean; last_error: string | null };
+type LiveStatus = { claim: unknown; hit: unknown; claim_busy: boolean; last_error: string | null; claim_status_details?: { pending_txid?: string; last_success_unix?: number; last_attempt_unix?: number; unavailable?: boolean } };
 
 function statusPayload(live: LiveStatus) {
   return {
@@ -23,7 +23,7 @@ async function openClaim(page: Page, claim: unknown = "AwaitingOwner", hit: unkn
   const live: LiveStatus = { claim, hit, claim_busy: false, last_error: null };
   await page.route("**/api/status", (route) => route.fulfill({ json: statusPayload(live) }));
   await page.goto("/");
-  if (hit && claim) await expect(page.locator("#claim-panel")).toBeVisible();
+  if (hit && claim && !(hit as { storage_pending?: boolean }).storage_pending) await expect(page.locator("#claim-panel")).toBeVisible();
   return live;
 }
 
@@ -64,8 +64,10 @@ test("editing the destination invalidates Send even after typing the old address
   await page.locator("#claim-destination").fill(OTHER_DESTINATION);
   await expect(page.locator("#btn-claim-confirm")).toBeDisabled();
   await expect(page.locator("#claim-destination-mismatch")).toContainText("erneut prüfen");
+  await expect(page.locator("#claim-step-summary")).toBeHidden();
   await page.locator("#claim-destination").fill(DESTINATION);
   await expect(page.locator("#btn-claim-confirm")).toBeDisabled();
+  await expect(page.locator("#claim-step-summary")).toBeHidden();
 });
 
 test("a second prepare hides A until B is rendered and sends exactly B's txid", async ({ page }) => {
@@ -112,8 +114,110 @@ test("a failed reprepare cannot send the previous preview", async ({ page }) => 
 test("a Prepared status after reload requires this tab to prepare before Send", async ({ page }) => {
   await openClaim(page, { Prepared: { summary: SUMMARY } });
   await expect(page.locator("#claim-summary-destination")).toHaveText(DESTINATION);
+  await expect(page.locator("#claim-destination-mismatch")).toBeEmpty();
+  await expect(page.locator("#claim-preview-status")).toContainText("erneut prüfen");
   await page.locator("#claim-destination").fill(DESTINATION);
   await expect(page.locator("#btn-claim-confirm")).toBeDisabled();
+});
+
+test("pending hit confirms CPU verification without claiming saved file permissions", async ({ page }) => {
+  await openClaim(page, "AwaitingOwner", { ...HIT, saved_filename: "", storage_pending: true });
+  await expect(page.locator("#hit-verification-status")).toContainText("CPU-VERIFIZIERT");
+  await expect(page.locator("#hit-verification-status")).toContainText("SPEICHERUNG AUSSTEHEND");
+  await expect(page.locator("#hit-verification-status")).not.toContainText("0600");
+  await expect(page.locator("#hit-subtitle")).toContainText("Prozess weiterlaufen lassen");
+});
+
+test("failed claim uses warning styling and a stable live status", async ({ page }) => {
+  await openClaim(page, { Failed: { reason: "submission_unknown" } });
+  const status = page.locator("#claim-result-status");
+  await expect(status).toHaveAttribute("role", "status");
+  await expect(status).toHaveAttribute("aria-live", "polite");
+  await expect(status).toHaveClass(/claim-status-failed/);
+  await expect(status).toHaveText("Einreichung prüfen");
+  const before = await status.evaluate((element) => {
+    const style = getComputedStyle(element, "::before");
+    return { color: style.backgroundColor, animation: style.animationName };
+  });
+  expect(before.color).toBe("rgb(251, 191, 36)");
+  expect(before.animation).toBe("none");
+});
+
+test("claim busy is explained while the form stays disabled", async ({ page }) => {
+  const live = await openClaim(page);
+  live.claim_busy = true;
+  await expect(page.locator("#claim-busy-notice")).toContainText("Vorgang läuft");
+  await expect(page.locator("#claim-busy-notice")).toContainText("Status wird aktualisiert");
+  await expect(page.locator("#claim-destination")).toBeDisabled();
+  await expect(page.locator("#btn-claim-prepare")).toBeDisabled();
+  live.claim_busy = false;
+  await expect(page.locator("#claim-busy-notice")).toBeEmpty();
+});
+
+test("unavailable provider checks preserve last known claim status and local pending txid", async ({ page }) => {
+  const live = await openClaim(page, { Failed: { reason: "submission_unknown" } });
+  live.claim_status_details = {
+    pending_txid: TXID_B,
+    last_success_unix: 1,
+    last_attempt_unix: 2,
+    unavailable: true,
+  };
+  await expect(page.locator("#claim-result-txid-row")).toBeVisible();
+  await expect(page.locator("#claim-result-txid")).toHaveText(TXID_B);
+  await expect(page.locator("#claim-result-txid")).toHaveCSS("user-select", "text");
+  await expect(page.locator("#claim-result-status")).toContainText("Statusabfragen nicht erreichbar");
+  await expect(page.locator("#claim-result-status")).toHaveClass(/claim-status-stale/);
+  await expect(page.locator("#claim-result-detail")).toContainText("Statusabfragen derzeit nicht erreichbar");
+  await expect(page.locator("#claim-result-detail")).toContainText("Zuletzt erfolgreich abgefragt");
+  await expect(page.locator("#claim-result-detail")).toContainText("Letzter Versuch");
+});
+
+test("provider unavailability marks submitted and confirmed states stale, then clears on recovery", async ({ page }) => {
+  const live = await openClaim(page, { Confirmed: { txid: TXID, block_height: 100 } });
+  live.claim_status_details = { last_success_unix: 1 };
+  const status = page.locator("#claim-result-status");
+  await expect(status).toHaveText("Bestätigt in Block 100");
+
+  live.claim_status_details = { pending_txid: TXID, last_success_unix: 1, last_attempt_unix: 2, unavailable: true };
+  await expect(status).toHaveText("Zuletzt bekannt: bestätigt in Block 100 · Statusabfragen nicht erreichbar");
+  await expect(status).toHaveClass(/claim-status-stale/);
+  await expect(page.locator("#claim-result-detail")).toContainText("Zuletzt erfolgreich abgefragt");
+
+  live.claim = { Submitted: { txid: TXID, submitted_at_unix: 1 } };
+  await expect(status).toHaveText("Eingereicht · Statusabfragen nicht erreichbar");
+  await expect(status).toHaveClass(/claim-status-stale/);
+  live.claim = { Failed: { reason: "submission_unknown" } };
+  await expect(status).toHaveText("Einreichung prüfen · Statusabfragen nicht erreichbar");
+  await expect(status).toHaveClass(/claim-status-stale/);
+
+  live.claim = { Confirmed: { txid: TXID, block_height: 100 } };
+  live.claim_status_details = { unavailable: true };
+  await expect(status).toContainText("Zuletzt bekannt: bestätigt in Block 100");
+  await expect(page.locator("#claim-result-detail")).toContainText("Zeitpunkt der letzten erfolgreichen Abfrage nicht verfügbar");
+  live.claim_status_details = { last_success_unix: 3, unavailable: false };
+  await expect(status).toHaveText("Bestätigt in Block 100");
+  await expect(status).toHaveClass(/claim-status-confirmed/);
+  await expect(status).not.toHaveClass(/claim-status-stale/);
+  await expect(page.locator("#claim-result-detail")).not.toContainText("Statusabfragen derzeit nicht erreichbar");
+});
+
+test("unchanged claim status is not rewritten on every polling cycle", async ({ page }) => {
+  await openClaim(page, { Submitted: { txid: TXID } });
+  const observer = await page.locator("#claim-result-status").evaluate((element) => {
+    const state = { mutations: 0 };
+    const observer = new MutationObserver(() => { state.mutations += 1; });
+    observer.observe(element, { characterData: true, childList: true, subtree: true, attributes: true });
+    (window as any).__claimStatusObserver = { observer, state };
+    return true;
+  });
+  expect(observer).toBeTruthy();
+  await page.waitForTimeout(1700);
+  const changes = await page.evaluate(() => {
+    const record = (window as any).__claimStatusObserver;
+    record.observer.disconnect();
+    return record.state.mutations;
+  });
+  expect(changes).toBe(0);
 });
 
 test("a changed preview from another tab invalidates this tab's Send authorization", async ({ page }) => {

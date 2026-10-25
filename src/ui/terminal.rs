@@ -134,7 +134,7 @@ impl SolverStats {
             self.electricity_eur_per_kwh
         );
         println!(
-            "  Cost Since Start:   {:.4} EUR ({:.4} kWh)",
+            "  Runtime Projection: {:.4} EUR ({:.4} kWh at current model/tariff)",
             cost_total_eur, kwh_consumed_total
         );
         println!(

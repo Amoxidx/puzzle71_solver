@@ -3,11 +3,11 @@ use puzzle71_solver::metal_engine::metal_solver::MetalSolver;
 use puzzle71_solver::search::rng::get_secure_uniform_u128;
 
 #[test]
-fn test_metal_gpu_vs_cpu_cross_validation_10000_keys() {
-    println!("Initializing Metal GPU Solver for 10,000-key Cross-Validation...");
+fn test_metal_ten_known_targets_and_ten_no_hit_batches() {
+    println!("Checking ten known targets and ten no-hit batches with the CPU reference...");
     let solver = MetalSolver::new().expect("Failed to initialize Metal Solver");
 
-    // Perform 10 independent batches of 1,024 keys = 10,240 keys tested
+    // Search ten 1,024-key batches, with one independently computed target per batch.
     let batch_count = 10;
     let threads_per_batch = 64;
     let steps_per_thread = 16;
@@ -77,13 +77,13 @@ fn test_metal_gpu_vs_cpu_cross_validation_10000_keys() {
     }
 
     println!(
-        "Successfully cross-validated {} keys across CPU & Metal GPU (0 mismatches, 0 false positives).",
+        "Found ten independently computed targets across batches spanning {} keys; ten no-hit batches returned none.",
         total_tested
     );
 }
 
 #[test]
-fn test_metal_large_batch_cross_validation_10000() {
+fn test_metal_finds_one_known_target_in_a_10240_key_batch() {
     let solver = MetalSolver::new().expect("Failed to initialize Metal Solver");
 
     // Single large batch of 10,240 keys (1024 threads x 10 steps)
@@ -104,7 +104,7 @@ fn test_metal_large_batch_cross_validation_10000() {
     let (ver_addr, ver_h160, _) = privkey_u128_to_address(gpu_result.unwrap());
     assert_eq!(ver_addr, cpu_addr);
     assert_eq!(ver_h160, cpu_h160);
-    println!("Large 10,240-key GPU batch verified successfully!");
+    println!("Known target at offset 7,777 found in the 10,240-key GPU batch.");
 }
 
 #[test]

@@ -124,7 +124,7 @@ impl<T: Transport> Submitter for SlipstreamSubmitter<T> {
             .transport
             .execute(Method::Get, &url, None, RATES_TIMEOUT_SECS)?;
         match response.status {
-            200 => parse_status_ok(&response.body),
+            200 => parse_status_ok(&response.body, txid),
             400 => parse_status_not_found(&response.body),
             other => Err(NetError::HttpStatus(other)),
         }
@@ -172,8 +172,11 @@ fn parse_submit_rejection(body: &str) -> Result<SubmitReceipt, SubmitError> {
     Err(SubmitError::Rejected(sanitize_reject_message(raw)))
 }
 
-fn parse_status_ok(body: &str) -> Result<TxStatus, NetError> {
+fn parse_status_ok(body: &str, expected_txid: &str) -> Result<TxStatus, NetError> {
     let value: Value = serde_json::from_str(body).map_err(|_| NetError::BadResponse)?;
+    if value.pointer("/transaction/txid").and_then(Value::as_str) != Some(expected_txid) {
+        return Err(NetError::BadResponse);
+    }
     let confirmed = value
         .pointer("/transaction/status/confirmed")
         .and_then(Value::as_bool)
@@ -547,6 +550,60 @@ mod tests {
             json_ok(&body),
         )]));
         assert_eq!(submitter.status(&txid).expect("pending"), TxStatus::Pending);
+    }
+
+    fn status_with_identity(identity: Option<&str>, confirmed: bool) -> Result<TxStatus, NetError> {
+        let txid = "aa".repeat(32);
+        let mut body: serde_json::Value = serde_json::from_str(LIVE_CONFIRMED).unwrap();
+        body["transaction"]["status"]["confirmed"] = confirmed.into();
+        body["transaction"]["status"]["block_height"] = 0.into();
+        if let Some(identity) = identity {
+            body["transaction"]["txid"] = identity.into();
+        } else {
+            body["transaction"].as_object_mut().unwrap().remove("txid");
+        }
+        SlipstreamSubmitter::new(FakeTransport::with_gets(vec![(
+            format!("{STATUS_URL_PREFIX}{txid}"),
+            json_ok(&body.to_string()),
+        )]))
+        .status(&txid)
+    }
+
+    #[test]
+    fn status_rejects_wrong_txid_when_pending() {
+        assert_eq!(
+            status_with_identity(Some(&"bb".repeat(32)), false),
+            Err(NetError::BadResponse)
+        );
+    }
+
+    #[test]
+    fn status_rejects_wrong_txid_when_confirmed() {
+        assert_eq!(
+            status_with_identity(Some(&"bb".repeat(32)), true),
+            Err(NetError::BadResponse)
+        );
+    }
+
+    #[test]
+    fn status_rejects_missing_txid_when_pending() {
+        assert_eq!(
+            status_with_identity(None, false),
+            Err(NetError::BadResponse)
+        );
+    }
+
+    #[test]
+    fn status_rejects_missing_txid_when_confirmed() {
+        assert_eq!(status_with_identity(None, true), Err(NetError::BadResponse));
+    }
+
+    #[test]
+    fn status_accepts_matching_txid_in_genesis_block() {
+        assert_eq!(
+            status_with_identity(Some(&"aa".repeat(32)), true),
+            Ok(TxStatus::Confirmed { block_height: 0 })
+        );
     }
 
     #[test]

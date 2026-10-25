@@ -68,6 +68,143 @@ async function gotoDashboard(page: Page): Promise<void> {
 }
 
 test.describe("Puzzle #71 dashboard", () => {
+  test("unavailable restored progress is shown as unavailable rather than zero", async ({ page }) => {
+    await page.route("**/api/status", (route) => route.fulfill({ json: {
+      is_running: false, mode: "HIGH", progress_available: false,
+      total_keys_tested: "0", total_blocks_tested: 0, current_keys_per_sec: 0, avg_keys_per_sec: 0,
+      estimated_package_power_watts: 20, estimated_soc_temp_celsius: 55, process_cpu_load_pct: 2,
+      runtime_secs: 0, target_gpu_duty_pct: 85, last_gpu_active_ms: 0, last_throttle_sleep_ms: 0,
+      checkpoint_saved_timestamp: 0, hit: null, claim: null, claim_busy: false, last_error: null,
+    } }));
+    await gotoDashboard(page);
+    await expect(page.locator("#val-total-keys")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-total-blocks")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-runtime")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-checkpoint")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-coverage-pct")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-cost-start")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#coverage-meter")).toHaveAttribute("aria-valuetext", "Suchhistorie nicht verfügbar");
+    await expect(page.locator("#history-note")).toContainText("leere Wert bedeutet nicht null");
+  });
+
+  test("missing progress_available remains compatible with older status payloads", async ({ page }) => {
+    await page.route("**/api/status", (route) => route.fulfill({ json: {
+      is_running: false, mode: "HIGH", total_keys_tested: "16777216", total_blocks_tested: 1,
+      current_keys_per_sec: 0, avg_keys_per_sec: 1000000, estimated_package_power_watts: 20,
+      estimated_soc_temp_celsius: 55, process_cpu_load_pct: 2, runtime_secs: 10, target_gpu_duty_pct: 85,
+      last_gpu_active_ms: 850, last_throttle_sleep_ms: 150, checkpoint_saved_timestamp: 1,
+      hit: null, claim: null, claim_busy: false, last_error: null,
+    } }));
+    await gotoDashboard(page);
+    await expect(page.locator("#val-total-keys")).toHaveText("16.777.216");
+    await expect(page.locator("#val-total-blocks")).toHaveText("1");
+  });
+
+  test("paused search has no current chance and identifies modeled values as last dispatch", async ({ page }) => {
+    await page.route("**/api/status", (route) => route.fulfill({ json: {
+      is_running: false, mode: "HIGH", total_keys_tested: "16777216", total_blocks_tested: 1,
+      current_keys_per_sec: 0, avg_keys_per_sec: 1000000, estimated_package_power_watts: 20,
+      estimated_soc_temp_celsius: 55, process_cpu_load_pct: 2, runtime_secs: 10, target_gpu_duty_pct: 85,
+      last_gpu_active_ms: 850, last_throttle_sleep_ms: 150, checkpoint_saved_timestamp: 1,
+      hit: null, claim: null, claim_busy: false, last_error: null,
+    } }));
+    await gotoDashboard(page);
+    await expect(page.locator("#odds-note")).toContainText("Suche pausiert");
+    await expect(page.locator("#val-odds-1h-pct")).toHaveText("0.00e+0%");
+    await expect(page.locator("#model-state-note")).toContainText("letzten Dispatch");
+  });
+
+  test("modeled lifetime cost and current cost projections use German euro formatting", async ({ page }) => {
+    await page.route("**/api/status", (route) => route.fulfill({ json: {
+      is_running: true, mode: "HIGH", total_keys_tested: "16777216", total_blocks_tested: 1,
+      current_keys_per_sec: 1000000, avg_keys_per_sec: 1000000, estimated_package_power_watts: 20,
+      estimated_soc_temp_celsius: 55, process_cpu_load_pct: 2, runtime_secs: 3600, target_gpu_duty_pct: 85,
+      last_gpu_active_ms: 850, last_throttle_sleep_ms: 150, checkpoint_saved_timestamp: 1,
+      hit: null, claim: null, claim_busy: false, last_error: null,
+    } }));
+    await gotoDashboard(page);
+    await expect(page.locator(".cost-label").first()).toHaveText("Hochrechnung seit Start");
+    await expect(page.locator("#val-cost-start")).toHaveText("0,0068 €");
+    await expect(page.locator("#val-cost-day")).toHaveText("0,16 €");
+    await expect(page.locator(".analytics-note").first()).toContainText("keine gemessene historische Abrechnung");
+  });
+
+  test("status live region stays quiet on identical polls and announces a changed mode", async ({ page }) => {
+    const live = {
+      is_running: false, mode: "HIGH", total_keys_tested: "0", total_blocks_tested: 0,
+      current_keys_per_sec: 0, avg_keys_per_sec: 0, estimated_package_power_watts: 20,
+      estimated_soc_temp_celsius: 55, process_cpu_load_pct: 2, runtime_secs: 0, target_gpu_duty_pct: 85,
+      last_gpu_active_ms: 850, last_throttle_sleep_ms: 150, checkpoint_saved_timestamp: 0,
+      hit: null, claim: null, claim_busy: false, last_error: null,
+    };
+    await page.route("**/api/status", (route) => route.fulfill({ json: live }));
+    await gotoDashboard(page);
+    await page.locator("#status-pill").evaluate((element) => {
+      const state = { mutations: [] as MutationRecord[] };
+      const observer = new MutationObserver((records) => state.mutations.push(...records));
+      observer.observe(element, { characterData: true, childList: true, subtree: true, attributes: true });
+      (window as any).__statusObserver = { observer, state };
+    });
+    await page.waitForTimeout(1700);
+    const unchangedMutations = await page.evaluate(() => {
+      const record = (window as any).__statusObserver;
+      const count = record.state.mutations.length;
+      record.state.mutations.length = 0;
+      return count;
+    });
+    expect(unchangedMutations).toBe(0);
+
+    live.mode = "BALANCED";
+    await expect(page.locator("#status-mode")).toContainText("BALANCED");
+    await expect.poll(() => page.evaluate(() => (window as any).__statusObserver.state.mutations.length)).toBeGreaterThan(0);
+    const changedTargets = await page.evaluate(() => {
+      const record = (window as any).__statusObserver;
+      record.observer.disconnect();
+      return record.state.mutations.map((mutation: MutationRecord) => (mutation.target as Element).id);
+    });
+    expect(changedTargets).toContain("status-mode");
+  });
+
+  test("reduced-motion rules independently stop the status pulse and pressed-button movement", async ({ page }) => {
+    let interceptedStops = 0;
+    await page.route("**/api/stop", (route) => {
+      interceptedStops += 1;
+      return route.fulfill({ json: { status: "stopped" } });
+    });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.route("**/api/status", (route) => route.fulfill({ json: {
+      is_running: true, mode: "HIGH", total_keys_tested: "0", total_blocks_tested: 0,
+      current_keys_per_sec: 0, avg_keys_per_sec: 0, estimated_package_power_watts: 20,
+      estimated_soc_temp_celsius: 55, process_cpu_load_pct: 2, runtime_secs: 0, target_gpu_duty_pct: 85,
+      last_gpu_active_ms: 850, last_throttle_sleep_ms: 150, checkpoint_saved_timestamp: 0,
+      hit: null, claim: null, claim_busy: false, last_error: null,
+    } }));
+    await gotoDashboard(page);
+    await expect.poll(() => page.locator("#status-pill .status-dot").evaluate((element) => getComputedStyle(element).animationName)).toBe("none");
+    const button = page.locator("#btn-toggle-run");
+    await button.hover();
+    await page.mouse.down();
+    await expect(button).toHaveCSS("transform", "none");
+    await page.mouse.up();
+    await expect.poll(() => interceptedStops).toBe(1);
+  });
+
+  test("power model is unavailable before the first GPU dispatch", async ({ page }) => {
+    await page.route("**/api/status", (route) => route.fulfill({ json: {
+      is_running: true, mode: "HIGH", total_keys_tested: "0", total_blocks_tested: 0,
+      current_keys_per_sec: 0, avg_keys_per_sec: 0, estimated_package_power_watts: 0,
+      estimated_soc_temp_celsius: 0, process_cpu_load_pct: 0, runtime_secs: 0, target_gpu_duty_pct: 85,
+      last_gpu_active_ms: 0, last_throttle_sleep_ms: 0, checkpoint_saved_timestamp: 0,
+      hit: null, claim: null, claim_busy: false, last_error: null,
+    } }));
+    await gotoDashboard(page);
+    await expect(page.locator("#val-power-watts")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-soc-temp")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-cost-start")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#val-cost-day")).toHaveText("Nicht verfügbar");
+    await expect(page.locator("#model-state-note")).toContainText("GPU-Dispatch liegt noch nicht vor");
+  });
+
   test("page loads with puzzle title", async ({ page }) => {
     await gotoDashboard(page);
     await expect(page).toHaveTitle(/Bitcoin Puzzle #71/);

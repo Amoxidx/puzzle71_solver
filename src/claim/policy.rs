@@ -6,6 +6,13 @@
 //! signature length produced for a given input.
 
 use bitcoin::Script;
+use bitcoin::hashes::Hash;
+
+use crate::claim::error::ClaimError;
+use crate::claim::prevout::VerifiedPrevout;
+
+/// Absolute block-weight ceiling, not a public-mempool standardness policy.
+pub const MAX_CLAIM_WEIGHT_WU: u64 = 4_000_000;
 
 /// Default fee rate used unless the caller overrides it. Deliberately the same as
 /// [`MIN_FEE_RATE_SAT_VB`]: a puzzle claim is a one-shot race against Kangaroo-style discrete-log
@@ -54,7 +61,7 @@ pub fn max_vsize(input_count: u64, destination_script: &Script) -> u64 {
     let inputs = input_count.saturating_mul(P2PKH_INPUT_MAX_VSIZE);
     let script_len = destination_script.len() as u64;
     let output = 8 + compact_size_len(script_len) + script_len;
-    base + inputs + output
+    base.saturating_add(inputs).saturating_add(output)
 }
 
 /// Whether spending an output worth `value_sat` as a single legacy P2PKH input is economic at
@@ -62,6 +69,59 @@ pub fn max_vsize(input_count: u64, destination_script: &Script) -> u64 {
 /// otherwise including it would spend more on fee than it is worth.
 pub fn is_economic(value_sat: u64, fee_rate: u64) -> bool {
     value_sat > P2PKH_INPUT_MAX_VSIZE * fee_rate
+}
+
+/// Selects the subset with the highest payout at the exact aggregate fee. For a fixed
+/// input count, the largest values maximize payout; evaluating every such prefix also
+/// accounts for CompactSize jumps and groups which jointly pay that overhead.
+pub(crate) fn select_prevouts<'a>(
+    prevouts: &'a [VerifiedPrevout],
+    destination_script: &Script,
+    fee_rate: u64,
+) -> Result<Vec<&'a VerifiedPrevout>, ClaimError> {
+    let mut candidates: Vec<_> = prevouts
+        .iter()
+        .filter(|p| is_economic(p.txout().value.to_sat(), fee_rate))
+        .collect();
+    if candidates.is_empty() {
+        return Err(ClaimError::NoEconomicInputs);
+    }
+    candidates.sort_by_key(|p| {
+        (
+            std::cmp::Reverse(p.txout().value.to_sat()),
+            p.outpoint().txid.to_byte_array(),
+            p.outpoint().vout,
+        )
+    });
+    let mut total = 0u64;
+    let mut best_payout = None;
+    let mut best_count = 0;
+    for (index, prevout) in candidates.iter().enumerate() {
+        total = total
+            .checked_add(prevout.txout().value.to_sat())
+            .ok_or(ClaimError::FeeMismatch)?;
+        let fee = max_vsize((index + 1) as u64, destination_script)
+            .checked_mul(fee_rate)
+            .ok_or(ClaimError::FeeMismatch)?;
+        if let Some(payout) = total.checked_sub(fee)
+            && best_payout.is_none_or(|best| payout > best)
+        {
+            best_payout = Some(payout);
+            best_count = index + 1;
+        }
+    }
+    if best_count == 0 {
+        return Err(ClaimError::OutputBelowDust);
+    }
+    candidates.truncate(best_count);
+    Ok(candidates)
+}
+
+pub(crate) fn check_max_weight(input_count: u64, script: &Script) -> Result<(), ClaimError> {
+    if max_vsize(input_count, script).saturating_mul(4) > MAX_CLAIM_WEIGHT_WU {
+        return Err(ClaimError::TransactionTooLarge);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -106,5 +166,18 @@ mod tests {
         assert!(!is_economic(break_even, fee_rate));
         assert!(is_economic(break_even + 1, fee_rate));
         assert!(!is_economic(break_even - 1, fee_rate));
+    }
+
+    #[test]
+    fn wallet_absolute_weight_ceiling_uses_four_million_weight_units() {
+        let script = p2pkh_25_byte_script();
+        assert!(check_max_weight(6756, &script).is_ok());
+        assert_eq!(
+            check_max_weight(6757, &script),
+            Err(ClaimError::TransactionTooLarge)
+        );
+        assert_eq!(MAX_CLAIM_WEIGHT_WU, 4_000_000);
+        // A private miner path is not constrained to public-mempool standardness here.
+        assert!(check_max_weight(1000, &script).is_ok());
     }
 }

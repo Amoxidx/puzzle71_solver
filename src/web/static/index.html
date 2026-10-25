@@ -25,9 +25,11 @@
         <button type="button" id="btn-claim-prepare" class="btn btn-primary">Adresse prüfen</button>
         <p id="claim-destination-error" class="claim-error" role="alert"></p>
         <p id="claim-destination-mismatch" class="claim-error" role="alert"></p>
+        <p id="claim-busy-notice" class="claim-busy-note" role="status" aria-live="polite" aria-atomic="true"></p>
       </div>
 
       <div id="claim-step-summary" class="claim-step hidden">
+        <p id="claim-preview-status" class="claim-hint"></p>
         <p id="claim-summary-destination" class="claim-address-groups mono"></p>
         <dl class="claim-summary-grid">
           <div class="claim-summary-row">
@@ -57,8 +59,11 @@
       <p id="claim-confirm-error" class="claim-error" role="alert"></p>
 
       <div id="claim-step-result" class="claim-step hidden">
-        <p id="claim-result-status" class="claim-result-status"></p>
-        <p id="claim-result-txid" class="claim-txid mono"></p>
+        <p id="claim-result-status" class="claim-result-status" role="status" aria-live="polite" aria-atomic="true"></p>
+        <div id="claim-result-txid-row" class="claim-txid-row hidden">
+          <span class="claim-txid-label">Transaktions-ID</span>
+          <p id="claim-result-txid" class="claim-txid mono"></p>
+        </div>
         <p id="claim-result-detail" class="claim-result-detail"></p>
       </div>
     </section>
@@ -110,8 +115,8 @@
             <time id="hit-timestamp" class="hit-code">–</time>
           </div>
           <div class="hit-row">
-            <span class="hit-label">CPU Re-Verifikation</span>
-            <span class="hit-badge-success">BESTÄTIGT &middot; DATEIRECHTE 0600</span>
+            <span class="hit-label">Trefferstatus</span>
+            <span id="hit-verification-status" class="hit-badge-success">CPU-VERIFIZIERT &middot; DATEIRECHTE 0600</span>
           </div>
         </div>
       </div>
@@ -122,7 +127,7 @@
           <span class="target-value mono" id="target-address">1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU</span>
         </div>
         <div class="target-item">
-          <span class="target-label">Reward</span>
+          <span class="target-label">Puzzle-Parameter</span>
           <span class="target-value mono">7.10 BTC</span>
         </div>
         <div class="target-item">
@@ -199,7 +204,7 @@
         </div>
         <div class="card-body">
           <div class="metric-hero">
-            <span id="val-power-watts" class="metric-value">0.0</span>
+            <span id="val-power-watts" class="metric-value">Nicht verfügbar</span>
             <span class="metric-unit">Watt</span>
           </div>
           <div class="metric-sublist">
@@ -222,7 +227,7 @@
         </div>
         <div class="card-body">
           <div class="metric-hero">
-            <span id="val-soc-temp" class="metric-value">0.0</span>
+            <span id="val-soc-temp" class="metric-value">Nicht verfügbar</span>
             <span class="metric-unit">&deg;C</span>
           </div>
           <div class="metric-sublist">
@@ -239,6 +244,7 @@
               <strong id="val-runtime" class="mono">00:00:00</strong>
             </div>
           </div>
+          <p id="model-state-note" class="metric-note">Temperatur geschätzt; Prozess-CPU ist ein Prozesswert.</p>
         </div>
       </article>
 
@@ -252,7 +258,7 @@
             <span id="val-total-keys" class="metric-value-sm mono">0</span>
             <span class="metric-unit">Keys</span>
           </div>
-          <div id="coverage-meter" class="coverage-meter" role="progressbar" aria-label="Abdeckung des Suchbereichs" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="coverage-meter" class="coverage-meter" role="progressbar" aria-label="Gezählte Historie des Suchbereichs" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <span id="coverage-meter-fill" class="coverage-meter-fill"></span>
           </div>
           <div class="metric-sublist">
@@ -265,10 +271,11 @@
               <strong id="val-checkpoint" class="mono">Noch nicht gespeichert</strong>
             </div>
             <div class="sub-row">
-              <span>Abdeckung 2^70</span>
+              <span>Gezählte Historie · 2^70</span>
               <strong id="val-coverage-pct" class="mono">0.000000000000%</strong>
             </div>
           </div>
+          <p id="history-note" class="metric-note">Übernommene Einträge wurden nicht automatisch rückwirkend nachgeprüft.</p>
         </div>
       </article>
     </main>
@@ -285,7 +292,7 @@
         </div>
         <div class="cost-grid">
           <div class="cost-item">
-            <span class="cost-label">Seit Start</span>
+            <span class="cost-label">Hochrechnung seit Start</span>
             <strong id="val-cost-start" class="cost-val">0.0000 &euro;</strong>
           </div>
           <div class="cost-item">
@@ -301,6 +308,7 @@
             <strong id="val-cost-year" class="cost-val">49.80 &euro;</strong>
           </div>
         </div>
+        <p class="analytics-note">Modellwert × gesamte Laufzeit; keine gemessene historische Abrechnung.</p>
       </article>
 
       <article class="analytics-card">
@@ -308,6 +316,7 @@
           <h2 class="analytics-title">Trefferchance bei eindeutiger Suche</h2>
           <span class="card-badge">Anteil am Keyspace</span>
         </div>
+        <p id="odds-note" class="analytics-note">Projektion bei Fortsetzung mit der gemessenen Rate.</p>
         <div class="odds-table">
           <div class="odds-row">
             <span class="odds-period">In 1 Stunde</span>

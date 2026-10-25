@@ -18,7 +18,44 @@ use crate::claim::error::ClaimError;
 use crate::claim::memory::secure_zero;
 
 const FOUND_KEY_LABEL: &str = "PRIVATE KEY (HEX):";
-const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
+const TIMESTAMP_LABEL: &str = "TIMESTAMP (UNIX):";
+pub(crate) const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
+
+/// Parses the bounded record once for both staged-hit recovery and claim-file loading.
+/// Missing, malformed, or repeated public timestamps do not invalidate a verified key.
+pub(crate) fn parse_found_key_record(content: &[u8]) -> Result<(u128, Option<u64>), ClaimError> {
+    if content.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(ClaimError::KeyFileFormat);
+    }
+    let text = std::str::from_utf8(content).map_err(|_| ClaimError::KeyFileFormat)?;
+    let mut key = None;
+    let mut timestamp = None;
+    let mut timestamp_count = 0;
+    for line in text.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix(FOUND_KEY_LABEL) {
+            if key.is_some() {
+                return Err(ClaimError::KeyFileFormat);
+            }
+            let hex = rest
+                .trim()
+                .strip_prefix("0x")
+                .ok_or(ClaimError::KeyFileFormat)?;
+            key = Some(u128::from_str_radix(hex, 16).map_err(|_| ClaimError::KeyFileFormat)?);
+        } else if let Some(rest) = line.strip_prefix(TIMESTAMP_LABEL) {
+            timestamp_count += 1;
+            let value = rest.trim();
+            timestamp = if timestamp_count == 1
+                && !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                value.parse().ok()
+            } else {
+                None
+            };
+        }
+    }
+    Ok((key.ok_or(ClaimError::KeyFileFormat)?, timestamp))
+}
 
 /// An independently derived, target-matching private key for the puzzle address.
 ///
@@ -41,8 +78,9 @@ impl ClaimKey {
         // `SecretKey::from_slice` expects.
         let mut bytes = [0u8; 32];
         bytes[16..].copy_from_slice(&key.to_be_bytes());
-        let secret = SecretKey::from_slice(&bytes).map_err(|_| ClaimError::KeyOutOfRange)?;
+        let parsed_secret = SecretKey::from_slice(&bytes);
         secure_zero(&mut bytes);
+        let mut secret = parsed_secret.map_err(|_| ClaimError::KeyOutOfRange)?;
 
         let secp = Secp256k1::signing_only();
         let secp_pubkey = secret.public_key(&secp);
@@ -52,6 +90,7 @@ impl ClaimKey {
             .to_byte_array();
 
         if hash160 != expected_hash160 {
+            secret.non_secure_erase();
             return Err(ClaimError::KeyDoesNotMatchTarget);
         }
 
@@ -62,8 +101,8 @@ impl ClaimKey {
         })
     }
 
-    /// Loads a `FOUND_KEY.txt`-formatted file (see `src/hit_handler.rs:88-110` for the exact
-    /// format this parses): requires file permissions to be exactly `0o600`, exactly one
+    /// Loads a `FOUND_KEY.txt`-formatted file: requires file permissions to be exactly
+    /// `0o600`, exactly one
     /// `PRIVATE KEY (HEX):` line whose `0x`-prefixed hex value lies within `range`, then derives
     /// and checks the key as in [`ClaimKey::from_u128`].
     pub fn load_found_key_file(
@@ -71,6 +110,16 @@ impl ClaimKey {
         expected_hash160: [u8; 20],
         range: RangeInclusive<u128>,
     ) -> Result<ClaimKey, ClaimError> {
+        Self::load_found_key_file_with_timestamp(path, expected_hash160, range).map(|(key, _)| key)
+    }
+
+    /// Loads the same independently verified key and its optional original public timestamp.
+    /// An absent, invalid, or repeated timestamp is returned as `None`.
+    pub fn load_found_key_file_with_timestamp(
+        path: &Path,
+        expected_hash160: [u8; 20],
+        range: RangeInclusive<u128>,
+    ) -> Result<(ClaimKey, Option<u64>), ClaimError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -95,48 +144,15 @@ impl ClaimKey {
             secure_zero(&mut content);
             return Err(ClaimError::KeyFileFormat);
         }
-        let Ok(text) = std::str::from_utf8(&content) else {
-            secure_zero(&mut content);
-            return Err(ClaimError::KeyFileFormat);
-        };
-        let mut found: Option<u128> = None;
-        // Collected instead of returned early from inside the loop so that every path below —
-        // success or a malformed line partway through the file — still reaches the
-        // `secure_zero(&mut content)` call right after the loop; `content` holds the raw
-        // file text, including the key hex, until then.
-        let mut parse_result: Result<(), ClaimError> = Ok(());
-        for line in text.lines() {
-            let Some(rest) = line.trim().strip_prefix(FOUND_KEY_LABEL) else {
-                continue;
-            };
-            if found.is_some() {
-                parse_result = Err(ClaimError::KeyFileFormat);
-                break;
-            }
-            let Some(hex_digits) = rest.trim().strip_prefix("0x") else {
-                parse_result = Err(ClaimError::KeyFileFormat);
-                break;
-            };
-            match u128::from_str_radix(hex_digits, 16) {
-                Ok(parsed) => found = Some(parsed),
-                Err(_) => {
-                    parse_result = Err(ClaimError::KeyFileFormat);
-                    break;
-                }
-            }
-        }
-
-        // Best effort (see `memory.rs`): erase the file's raw text, which contains the key hex,
-        // on every path from here on, not only the success path.
+        let parsed = parse_found_key_record(&content);
+        // Erase the raw file text on parser errors as well as success (best effort).
         secure_zero(&mut content);
-
-        parse_result?;
-        let key = found.ok_or(ClaimError::KeyFileFormat)?;
+        let (key, timestamp) = parsed?;
         if !range.contains(&key) {
             return Err(ClaimError::KeyOutOfRange);
         }
 
-        ClaimKey::from_u128(key, expected_hash160)
+        Ok((ClaimKey::from_u128(key, expected_hash160)?, timestamp))
     }
 
     /// The secret scalar. Restricted to `src/claim/` — used only to sign claim inputs.
@@ -348,5 +364,60 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_regression_timestamp_metadata_is_optional_unique_and_bounded() {
+        for (metadata, expected) in [
+            ("TIMESTAMP (UNIX): 42\n", Some(42)),
+            ("TIMESTAMP (UNIX): 0\n", Some(0)),
+            ("TIMESTAMP (UNIX): 18446744073709551615\n", Some(u64::MAX)),
+            ("", None),
+            ("TIMESTAMP (UNIX): invalid\n", None),
+            ("TIMESTAMP (UNIX): +42\n", None),
+            ("TIMESTAMP (UNIX): -1\n", None),
+            ("TIMESTAMP (UNIX): 18446744073709551616\n", None),
+            ("TIMESTAMP (UNIX): 42\nTIMESTAMP (UNIX): 42\n", None),
+            ("TIMESTAMP (UNIX): broken\nTIMESTAMP (UNIX): 42\n", None),
+        ] {
+            let dir = temp_dir("timestamp");
+            let path = dir.join("FOUND_KEY.txt");
+            write_key_file(
+                &path,
+                0o600,
+                &format!("{metadata}PRIVATE KEY (HEX): 0x{TEST_SCALAR:x}\n"),
+            );
+            let (key, timestamp) = ClaimKey::load_found_key_file_with_timestamp(
+                &path,
+                test_hash160(),
+                TEST_SCALAR..=TEST_SCALAR,
+            )
+            .unwrap();
+            assert_eq!(timestamp, expected);
+            assert_eq!(key.hash160(), test_hash160());
+            // The compatibility wrapper accepts exactly the same verified key.
+            ClaimKey::load_found_key_file(&path, test_hash160(), TEST_SCALAR..=TEST_SCALAR)
+                .unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn audit_regression_timestamp_does_not_bypass_key_record_validation() {
+        for tail in [
+            "",
+            "PRIVATE KEY (HEX): invalid\n",
+            "PRIVATE KEY (HEX): 0x1\nPRIVATE KEY (HEX): 0x1\n",
+        ] {
+            let dir = temp_dir("timestamp-key-error");
+            let path = dir.join("FOUND_KEY.txt");
+            write_key_file(&path, 0o600, &format!("TIMESTAMP (UNIX): 42\n{tail}"));
+            assert_eq!(
+                ClaimKey::load_found_key_file_with_timestamp(&path, test_hash160(), 0..=u128::MAX)
+                    .unwrap_err(),
+                ClaimError::KeyFileFormat
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

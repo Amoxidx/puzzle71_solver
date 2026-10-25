@@ -1,6 +1,7 @@
 //! Parsing and validating the owner-supplied claim destination address.
 
 use bitcoin::address::NetworkUnchecked;
+use bitcoin::secp256k1::XOnlyPublicKey;
 use bitcoin::{Address, AddressType, Network, Script};
 
 use crate::claim::error::ClaimError;
@@ -22,20 +23,33 @@ pub fn parse_destination(
         .require_network(network)
         .map_err(|_| ClaimError::WrongNetwork)?;
 
-    match address.address_type() {
-        Some(AddressType::P2pkh)
-        | Some(AddressType::P2sh)
-        | Some(AddressType::P2wpkh)
-        | Some(AddressType::P2wsh)
-        | Some(AddressType::P2tr) => {}
-        _ => return Err(ClaimError::UnsupportedAddressType),
-    }
+    validate_destination_type(&address)?;
 
     if address.script_pubkey().as_script() == forbidden_script {
         return Err(ClaimError::DestinationIsPuzzleAddress);
     }
 
     Ok(address)
+}
+
+/// Also used by the offline builder and verifier, whose callers can supply an `Address`
+/// without going through the owner-input parser.
+pub(crate) fn validate_destination_type(address: &Address) -> Result<(), ClaimError> {
+    match address.address_type() {
+        Some(AddressType::P2pkh)
+        | Some(AddressType::P2sh)
+        | Some(AddressType::P2wpkh)
+        | Some(AddressType::P2wsh) => {}
+        Some(AddressType::P2tr) => {
+            let program = address
+                .witness_program()
+                .ok_or(ClaimError::InvalidAddress)?;
+            XOnlyPublicKey::from_slice(program.program().as_bytes())
+                .map_err(|_| ClaimError::InvalidAddress)?;
+        }
+        _ => return Err(ClaimError::UnsupportedAddressType),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -113,5 +127,20 @@ mod tests {
     fn trims_surrounding_whitespace_before_parsing() {
         let padded = format!("  {P2PKH}  \n");
         assert!(parse_destination(&padded, Network::Bitcoin, &unrelated_script()).is_ok());
+    }
+
+    #[test]
+    fn audit_regression_rejects_checksummed_taproot_without_a_curve_point() {
+        let impossible = "bc1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqqenm";
+        let parsed: Address<NetworkUnchecked> = impossible.parse().unwrap();
+        assert_eq!(
+            parsed.assume_checked().address_type(),
+            Some(AddressType::P2tr)
+        );
+        assert!(
+            parse_destination(impossible, Network::Bitcoin, &unrelated_script()).is_err(),
+            "checksummed Taproot program without a curve point was accepted"
+        );
+        assert!(parse_destination(P2TR, Network::Bitcoin, &unrelated_script()).is_ok());
     }
 }

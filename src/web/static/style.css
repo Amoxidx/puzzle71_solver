@@ -433,6 +433,10 @@ code,
   letter-spacing: 0.04em;
 }
 
+.hit-badge-pending {
+  color: var(--warn);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Claim panel                                                                */
 /* -------------------------------------------------------------------------- */
@@ -526,6 +530,32 @@ code,
   color: var(--fg-muted);
 }
 
+.claim-busy-note,
+.claim-preview-stale,
+.analytics-note,
+.metric-note {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.claim-busy-note {
+  color: var(--warn);
+}
+
+.claim-busy-note:empty,
+.metric-note:empty {
+  display: none;
+}
+
+.claim-preview-stale {
+  color: var(--warn);
+}
+
+.analytics-note,
+.metric-note {
+  margin-top: var(--space-3);
+}
+
 .claim-error {
   min-height: 1.2em;
   font-size: 13px;
@@ -592,11 +622,60 @@ code,
   color: var(--fg);
 }
 
+.claim-result-status.claim-status-submitted {
+  color: var(--fg-muted);
+}
+
+.claim-result-status.claim-status-confirmed {
+  color: var(--signal);
+}
+
+.claim-result-status.claim-status-failed {
+  color: var(--warn);
+}
+
+.claim-result-status.claim-status-stale {
+  color: var(--warn);
+}
+
+.claim-result-status.claim-status-submitted::before {
+  background-color: var(--fg-muted);
+  box-shadow: 0 0 0 4px rgba(138, 138, 144, 0.14);
+}
+
+.claim-result-status.claim-status-confirmed::before {
+  background-color: var(--signal);
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.16);
+}
+
+.claim-result-status.claim-status-failed::before {
+  background-color: var(--warn);
+  box-shadow: 0 0 0 4px var(--halo-warm-soft);
+}
+
+.claim-result-status.claim-status-stale::before {
+  background-color: var(--warn);
+  box-shadow: 0 0 0 4px var(--halo-warm-soft);
+}
+
 .claim-txid {
   overflow-wrap: anywhere;
   word-break: break-all;
   font-size: 13px;
   color: var(--fg);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.claim-txid-row {
+  min-width: 0;
+}
+
+.claim-txid-label {
+  display: block;
+  margin-bottom: var(--space-1);
+  color: var(--fg-muted);
+  font-size: 12px;
 }
 
 .claim-result-detail {
@@ -614,10 +693,6 @@ code,
   background-color: var(--signal);
   box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.16);
   vertical-align: middle;
-}
-
-#claim-step-result:not(.hidden) .claim-result-status::before {
-  animation: status-pulse 2.4s ease-in-out infinite;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1330,8 +1405,7 @@ input:focus-visible {
     scroll-behavior: auto !important;
   }
 
-  .status-running .status-dot,
-  #claim-step-result:not(.hidden) .claim-result-status::before {
+  .status-running .status-dot {
     animation: none;
   }
 
