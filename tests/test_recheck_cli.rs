@@ -1,5 +1,6 @@
 //! Exercise scope preparation through the real binary without starting GPU work.
 use puzzle71_solver::search::checkpoint::CheckpointState;
+use puzzle71_solver::search::recheck::RecheckPlan;
 use puzzle71_solver::search::store::{CheckpointLock, CheckpointStore};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::PathBuf, process::Command};
@@ -102,4 +103,46 @@ fn preparation_refuses_an_existing_destination_without_overwriting_it() {
     let output = f.prepare();
     assert!(!output.status.success());
     assert_eq!(fs::read(path).unwrap(), b"keep-existing-history");
+}
+
+#[test]
+fn real_prepare_accepts_unverified_targets_without_importing_them_as_global_history() {
+    let f = Fixture::new();
+    let manifest = serde_json::json!({
+        "type": "puzzle71-unverified-targets", "format": 1,
+        "puzzle_number": 71,
+        "range_min": puzzle71_solver::puzzle_config::RANGE_MIN.to_string(),
+        "range_max": puzzle71_solver::puzzle_config::RANGE_MAX.to_string(),
+        "block_size": BLOCK.to_string(),
+        "target_hash160": "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8",
+        "block_indices": [7, 2, 9, 1],
+    });
+    fs::write(&f.source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let original = fs::read(&f.source).unwrap();
+    let output = f.prepare();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("4 blocks"));
+    assert!(stdout.contains("No search started"));
+    assert!(!stdout.contains("Executing mandatory"));
+    let path = f.target.join("puzzle71_checkpoint.json");
+    let snapshot: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["format"], 3);
+    assert_eq!(snapshot["recheck"]["completed"], 0);
+    assert_eq!(snapshot["checkpoint"]["total_blocks_tested"], 3);
+    assert_eq!(
+        snapshot["checkpoint"]["total_keys_tested"],
+        (3 * BLOCK) as u64
+    );
+    let plan = RecheckPlan::load(&f.source, BLOCK).unwrap();
+    let store = CheckpointStore::open_recheck(CheckpointLock::acquire(&path).unwrap(), BLOCK, plan)
+        .unwrap();
+    assert_eq!(store.next_recheck_block(), Some(7));
+    assert!(!store.is_scanned(9));
+    assert!(!store.is_scanned(1));
+    assert_eq!(fs::read(&f.source).unwrap(), original);
 }

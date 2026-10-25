@@ -1,16 +1,41 @@
-//! Identity-bound, ordered replay of an immutable legacy checkpoint.
+//! Identity-bound, ordered search of an immutable archive or explicit target list.
 
 use crate::crypto::sha256::sha256;
 use crate::puzzle_config::{PUZZLE_NUMBER, RANGE_MAX, RANGE_MIN, RANGE_SIZE, TARGET_HASH160};
 use crate::search::checkpoint::CheckpointState;
 use crate::search::duplicate_filter::IntervalSet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// This is a search request, never evidence of previously completed work.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnverifiedTargets {
+    #[serde(rename = "type")]
+    source_type: String,
+    format: u32,
+    puzzle_number: u32,
+    range_min: String,
+    range_max: String,
+    block_size: String,
+    target_hash160: String,
+    block_indices: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum PlanBlocks {
+    Legacy {
+        intervals: Vec<(u64, u64)>,
+        ordinal_ends: Vec<u64>,
+    },
+    UnverifiedTargets(Vec<u64>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,14 +61,13 @@ pub struct RecheckProgress {
 #[derive(Clone, Debug)]
 pub struct RecheckPlan {
     identity: RecheckIdentity,
-    intervals: Vec<(u64, u64)>,
-    ordinal_ends: Vec<u64>,
+    blocks: PlanBlocks,
     source_path: PathBuf,
     source_file: (u64, u64),
 }
 
 impl RecheckPlan {
-    /// Read the exact archived bytes once. This never creates a journal or writer lock.
+    /// Read the exact source bytes once. This never creates a journal or writer lock.
     pub fn load(path: impl AsRef<Path>, block_size: u128) -> Result<Self, String> {
         if block_size == 0
             || block_size > RANGE_SIZE
@@ -74,33 +98,75 @@ impl RecheckPlan {
         if bytes.len() as u64 > MAX_SOURCE_BYTES {
             return Err("Recheck source grew beyond the 32 MiB limit".into());
         }
-        let state = CheckpointState::from_json(&bytes)?;
-        state.validate_for_block_size(block_size)?;
-        if state.total_blocks_tested == 0 {
-            return Err("Recheck source must contain at least one complete block".into());
-        }
-        let mut total = 0u64;
-        let ordinal_ends = state
-            .scanned_intervals
-            .iter()
-            .map(|&(start, end)| {
-                total += end - start + 1; // validated checked total in CheckpointState
-                total
-            })
-            .collect();
+        // Inspect only the top-level discriminator; deserialize the original bytes
+        // again so duplicate fields and unknown target fields cannot be normalized away.
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Invalid recheck source JSON: {e}"))?;
+        let explicit_source = value.get("type").is_some() || value.get("format").is_some();
+        let (blocks, total_blocks) = if explicit_source {
+            let targets: UnverifiedTargets = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Invalid unverified-target manifest: {e}"))?;
+            if targets.source_type != "puzzle71-unverified-targets"
+                || targets.format != 1
+                || targets.puzzle_number != PUZZLE_NUMBER
+                || targets.range_min != RANGE_MIN.to_string()
+                || targets.range_max != RANGE_MAX.to_string()
+                || targets.block_size != block_size.to_string()
+                || targets.target_hash160 != target_hash160()
+            {
+                return Err(
+                    "Unverified-target manifest type, format or puzzle binding mismatch".into(),
+                );
+            }
+            if targets.block_indices.is_empty() {
+                return Err("Unverified-target manifest requires at least one block".into());
+            }
+            let mut unique = HashSet::with_capacity(targets.block_indices.len());
+            for &index in &targets.block_indices {
+                if index as u128 >= RANGE_SIZE / block_size || !unique.insert(index) {
+                    return Err(
+                        "Unverified-target blocks must be unique and inside the puzzle range"
+                            .into(),
+                    );
+                }
+            }
+            let total = targets.block_indices.len() as u64;
+            (PlanBlocks::UnverifiedTargets(targets.block_indices), total)
+        } else {
+            let state = CheckpointState::from_json(&bytes)?;
+            state.validate_for_block_size(block_size)?;
+            if state.total_blocks_tested == 0 {
+                return Err("Recheck source must contain at least one complete block".into());
+            }
+            let mut total = 0u64;
+            let ordinal_ends = state
+                .scanned_intervals
+                .iter()
+                .map(|&(start, end)| {
+                    total += end - start + 1; // validated checked total in CheckpointState
+                    total
+                })
+                .collect();
+            (
+                PlanBlocks::Legacy {
+                    intervals: state.scanned_intervals,
+                    ordinal_ends,
+                },
+                total,
+            )
+        };
         Ok(Self {
             identity: RecheckIdentity {
                 source_sha256: digest(&bytes),
-                total_blocks: state.total_blocks_tested,
+                total_blocks,
                 puzzle_number: PUZZLE_NUMBER,
                 range_min: RANGE_MIN.to_string(),
                 range_max: RANGE_MAX.to_string(),
                 block_size: block_size.to_string(),
-                target_hash160: TARGET_HASH160.iter().map(|b| format!("{b:02x}")).collect(),
+                target_hash160: target_hash160(),
                 kernel_sha256: digest(include_bytes!("../metal_engine/kernel.metal")),
             },
-            intervals: state.scanned_intervals,
-            ordinal_ends,
+            blocks,
             source_path,
             source_file: (metadata.dev(), metadata.ino()),
         })
@@ -114,13 +180,47 @@ impl RecheckPlan {
         if ordinal >= self.identity.total_blocks {
             return None;
         }
-        let index = self.ordinal_ends.partition_point(|&end| end <= ordinal);
-        let previous = if index == 0 {
-            0
-        } else {
-            self.ordinal_ends[index - 1]
-        };
-        Some(self.intervals[index].0 + ordinal - previous)
+        match &self.blocks {
+            PlanBlocks::UnverifiedTargets(indices) => indices.get(ordinal as usize).copied(),
+            PlanBlocks::Legacy {
+                intervals,
+                ordinal_ends,
+            } => {
+                let index = ordinal_ends.partition_point(|&end| end <= ordinal);
+                let previous = if index == 0 {
+                    0
+                } else {
+                    ordinal_ends[index - 1]
+                };
+                Some(intervals[index].0 + ordinal - previous)
+            }
+        }
+    }
+
+    /// Keep target scopes unreadable to programs that only understand legacy scopes.
+    pub(crate) fn scoped_format(&self) -> u32 {
+        match &self.blocks {
+            PlanBlocks::Legacy { .. } => 2,
+            PlanBlocks::UnverifiedTargets(_) => 3,
+        }
+    }
+
+    /// Legacy archives claim all their blocks were counted before preparation.
+    /// Explicit targets claim no history, but every completed prefix block must exist.
+    pub(crate) fn required_coverage_is_present(
+        &self,
+        global: &IntervalSet,
+        completed: u64,
+    ) -> bool {
+        if completed > self.identity.total_blocks {
+            return false;
+        }
+        match &self.blocks {
+            PlanBlocks::Legacy { .. } => self.is_covered_by(global),
+            PlanBlocks::UnverifiedTargets(indices) => indices[..completed as usize]
+                .iter()
+                .all(|&index| global.contains(index)),
+        }
     }
 
     pub(crate) fn is_source_file(&self, path: &Path) -> Result<bool, String> {
@@ -149,8 +249,14 @@ impl RecheckPlan {
     }
 
     pub(crate) fn is_covered_by(&self, global: &IntervalSet) -> bool {
+        let intervals = match &self.blocks {
+            PlanBlocks::Legacy { intervals, .. } => intervals,
+            PlanBlocks::UnverifiedTargets(indices) => {
+                return indices.iter().all(|&id| global.contains(id));
+            }
+        };
         let mut index = 0;
-        for &(start, end) in &self.intervals {
+        for &(start, end) in intervals {
             while index < global.intervals.len() && global.intervals[index].1 < start {
                 index += 1;
             }
@@ -171,6 +277,10 @@ impl RecheckPlan {
         }
         true
     }
+}
+
+fn target_hash160() -> String {
+    TARGET_HASH160.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -207,6 +317,20 @@ mod tests {
             state.total_keys_tested = state.total_blocks_tested as u128 * BLOCK_SIZE;
             state.scanned_intervals = intervals;
             state.save_to_file(self.source()).unwrap();
+        }
+        fn write_targets(&self, indices: &[u64]) -> serde_json::Value {
+            let value = serde_json::json!({
+                "type": "puzzle71-unverified-targets",
+                "format": 1,
+                "puzzle_number": PUZZLE_NUMBER,
+                "range_min": RANGE_MIN.to_string(),
+                "range_max": RANGE_MAX.to_string(),
+                "block_size": BLOCK_SIZE.to_string(),
+                "target_hash160": target_hash160(),
+                "block_indices": indices,
+            });
+            fs::write(self.source(), serde_json::to_vec(&value).unwrap()).unwrap();
+            value
         }
     }
     impl Drop for Fixture {
@@ -280,6 +404,85 @@ mod tests {
         let second = RecheckPlan::load(f.source(), BLOCK_SIZE).unwrap();
         assert_ne!(first.identity(), second.identity());
         assert_eq!(first.block_at(1), second.block_at(1));
+    }
+
+    #[test]
+    fn unverified_targets_preserve_declared_order_and_bind_exact_bytes_without_claiming_history() {
+        let f = Fixture::new();
+        f.write_targets(&[7, 2, 100, 3]);
+        let bytes = fs::read(f.source()).unwrap();
+        let plan = RecheckPlan::load(f.source(), BLOCK_SIZE).unwrap();
+        assert_eq!(plan.scoped_format(), 3);
+        assert_eq!(plan.identity().source_sha256, digest(&bytes));
+        assert_eq!(
+            plan.identity().kernel_sha256,
+            digest(include_bytes!("../metal_engine/kernel.metal"))
+        );
+        assert_eq!(
+            (0..=4).map(|i| plan.block_at(i)).collect::<Vec<_>>(),
+            vec![Some(7), Some(2), Some(100), Some(3), None]
+        );
+        let global = IntervalSet {
+            intervals: vec![(2, 3), (7, 7)],
+        };
+        assert!(plan.required_coverage_is_present(&IntervalSet::new(), 0));
+        assert!(plan.required_coverage_is_present(&global, 2));
+        assert!(!plan.required_coverage_is_present(&global, 3));
+        assert!(!plan.required_coverage_is_present(&global, 4));
+        assert!(!plan.required_coverage_is_present(&global, 5));
+        assert_eq!(fs::read(f.source()).unwrap(), bytes);
+        assert!(!f.source().with_extension("journal").exists());
+        assert!(!f.source().with_extension("lock").exists());
+        assert!(CheckpointState::load_from_file(f.source()).is_err());
+        let mut different_bytes = bytes;
+        different_bytes.push(b'\n');
+        fs::write(f.source(), different_bytes).unwrap();
+        let changed = RecheckPlan::load(f.source(), BLOCK_SIZE).unwrap();
+        assert_ne!(plan.identity(), changed.identity());
+        assert_eq!(plan.block_at(2), changed.block_at(2));
+    }
+
+    #[test]
+    fn unverified_targets_reject_unknown_fields_bindings_duplicates_and_invalid_indices() {
+        let f = Fixture::new();
+        let valid = f.write_targets(&[0, (RANGE_SIZE / BLOCK_SIZE - 1) as u64]);
+        assert!(RecheckPlan::load(f.source(), BLOCK_SIZE).is_ok());
+        for (field, wrong) in [
+            ("type", serde_json::json!("unknown-search-request")),
+            ("format", serde_json::json!(2)),
+            ("puzzle_number", serde_json::json!(70)),
+            ("range_min", serde_json::json!("0")),
+            ("range_max", serde_json::json!("0")),
+            (
+                "block_size",
+                serde_json::json!((BLOCK_SIZE * 2).to_string()),
+            ),
+            ("block_size", serde_json::json!(BLOCK_SIZE as u64)),
+            ("target_hash160", serde_json::json!("00".repeat(20))),
+            ("unknown", serde_json::json!(true)),
+            ("block_indices", serde_json::json!([])),
+            ("block_indices", serde_json::json!([1, 1])),
+            (
+                "block_indices",
+                serde_json::json!([RANGE_SIZE / BLOCK_SIZE]),
+            ),
+            ("block_indices", serde_json::json!([-1])),
+            ("block_indices", serde_json::json!([1.5])),
+            ("block_indices", serde_json::json!(["1"])),
+        ] {
+            let mut damaged = valid.clone();
+            damaged[field] = wrong;
+            fs::write(f.source(), serde_json::to_vec(&damaged).unwrap()).unwrap();
+            assert!(
+                RecheckPlan::load(f.source(), BLOCK_SIZE).is_err(),
+                "accepted {field}: {damaged}"
+            );
+        }
+        let duplicate_field = serde_json::to_string(&valid)
+            .unwrap()
+            .replace("\"format\":1", "\"format\":1,\"format\":1");
+        fs::write(f.source(), duplicate_field).unwrap();
+        assert!(RecheckPlan::load(f.source(), BLOCK_SIZE).is_err());
     }
     #[test]
     fn fifo_source_returns_regular_file_error_without_waiting_for_a_writer() {

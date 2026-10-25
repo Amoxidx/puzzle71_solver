@@ -125,7 +125,26 @@ cd recheck-run
 
 Die Vorbereitung startet weder GPU-Suche noch Auszahlung. Sie verlangt vorhandene, gültige Snapshot-/Journalkopien und lehnt bereits vorhandene Zieldateien ab. Archive mit fehlenden Blöcken in der kopierten globalen Historie werden abgelehnt. Das Archiv wird nur gelesen; keine Produktionsdatei als Historienkopie angeben. Die Nachprüfung bindet genaue Archivbytes, Blockgröße, Puzzlebereich, Ziel-HASH160 und eingebetteten Kernel. Eine abweichende Quelle oder ein ungekennzeichneter Arbeitsstand startet keine frische Suche.
 
-Für die Wiederaufnahme gehören das unveränderte Archiv, der neue Snapshot und sein Journal zusammen. Die Oberfläche zeigt gezählte globale Historie und Nachprüfungsfortschritt getrennt. Nachprüfungsstände verwenden einen ausdrücklich versionierten Wrapper; ältere Programme können sie nicht laden. Bei einem Rückbau müssen deshalb auch Startargumente und Arbeitsverzeichnis zum jeweiligen Programmstand passen. Einen bestehenden aktuellen Arbeitsstand weiter sichern; ihn nicht durch eine alte Kopie ersetzen.
+Für ausdrücklich **unbestätigte** Zielblöcke akzeptiert dasselbe `--recheck-source` außerdem einen versionierten JSON-Suchauftrag. Er ist kein Checkpoint und behauptet keine vergangene Abdeckung. Das folgende Beispiel verwendet `2^24` Schlüssel pro Block:
+
+```json
+{
+  "type": "puzzle71-unverified-targets",
+  "format": 1,
+  "puzzle_number": 71,
+  "range_min": "1180591620717411303424",
+  "range_max": "2361183241434822606847",
+  "block_size": "16777216",
+  "target_hash160": "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8",
+  "block_indices": [7, 2, 88, 1]
+}
+```
+
+Alle Felder sind verpflichtend; zusätzliche Felder, unbekannte Typen oder Versionen, doppelte IDs und IDs außerhalb des Puzzlebereichs werden abgelehnt. Bereichsgrenzen und Blockgröße sind kanonische dezimale Strings, Block-IDs sind JSON-Integer vom Typ `u64`. Die Liste muss mindestens eine ID enthalten. Die Reihenfolge bleibt exakt erhalten, auch zwischen unsortierten Gruppen; sie wird nicht nach IDs sortiert. Öffentliche Herkunftsbelege und SHA256-Werte der Originalarchive können separat aufbewahrt werden. Sie ändern den Suchauftrag nicht in eine Bestätigung alter Sucharbeit.
+
+Vorbereiten und starten erfolgt mit denselben Befehlen wie beim Archiv, mit dem Suchauftrag als Quelle. Die Vorbereitung übernimmt ausschließlich die echte kopierte Historie und fügt durch die Zielliste **keinen** globalen Block hinzu. Ein bereits global vorhandener Zielblock wird trotzdem erneut geprüft; ein bisher fehlender Zielblock erhöht erst nach vollständig abgeschlossener Berechnung und synchronisiertem Journaleintrag die globale Abdeckung. Pausen und Teilblöcke erhöhen den Zielcursor nicht. Bei Wiederaufnahme muss jeder Block des bereits abgeschlossenen Zielpräfixes global enthalten sein, einschließlich bei vollständig abgearbeiteter Liste. Der Legacy-Archivpfad verlangt weiterhin sämtliche Archivblöcke in der kopierten und fortgesetzten globalen Historie.
+
+Für die Wiederaufnahme gehören die unveränderte Quelle, der neue Snapshot und sein Journal zusammen. Genaue Quelldateibytes, Kernel und Puzzleparameter bleiben gebunden. Die Oberfläche zeigt gezählte globale Historie und Nachprüfungsfortschritt getrennt. Legacy-Archivstände verwenden Wrapper-/Journalformat 2, Suchaufträge für unbestätigte Ziele verwenden Format 3. Ältere Programme können die jeweils neueren Stände nicht laden. Ein bestehender Format-2-Arbeitsstand wird nicht in einen neuen Suchauftrag umgewandelt; dafür ist eine neue Vorbereitung aus einer angehaltenen Legacy-Historienkopie erforderlich. Bei einem Rückbau müssen deshalb auch Startargumente und Arbeitsverzeichnis zum jeweiligen Programmstand passen. Einen bestehenden aktuellen Arbeitsstand weiter sichern; ihn nicht durch eine alte Kopie ersetzen.
 
 ## Trefferverhalten und Geheimnisse
 

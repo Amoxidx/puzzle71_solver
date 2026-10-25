@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FORMAT_VERSION: u32 = 1;
-const SCOPED_FORMAT_VERSION: u32 = 2;
 const COMPACTION_INTERVAL: Duration = Duration::from_secs(3600);
 const COMPACTION_BYTES: u64 = 1024 * 1024;
 const MAX_REPLAY_BYTES: u64 = 8 * 1024 * 1024;
@@ -110,7 +109,7 @@ impl JournalHeader {
     fn for_scope(block_size: u128, recheck: Option<&RecheckState>) -> Self {
         let mut header = Self::for_block_size(block_size);
         if let Some(recheck) = recheck {
-            header.format = SCOPED_FORMAT_VERSION;
+            header.format = recheck.plan.scoped_format();
             header.recheck = Some(recheck.plan.identity().clone());
         }
         header
@@ -212,13 +211,13 @@ impl CheckpointStore {
             CheckpointLock::acquire_recheck(copied_history, &plan)?,
             block_size,
         )?;
-        if !plan.is_covered_by(&history.filter.intervals) {
+        if !plan.required_coverage_is_present(&history.filter.intervals, 0) {
             return Err("Recheck source blocks are absent from the copied global history".into());
         }
         let mut checkpoint = history.snapshot();
         checkpoint.last_saved_timestamp = timestamp().max(checkpoint.last_saved_timestamp);
         let snapshot = ScopedSnapshot {
-            format: SCOPED_FORMAT_VERSION,
+            format: plan.scoped_format(),
             recheck: RecheckProgress {
                 identity: plan.identity().clone(),
                 completed: 0,
@@ -267,7 +266,7 @@ impl CheckpointStore {
                 .map_err(|e| format!("Recheck requires an existing scoped snapshot: {e}"))?;
             let scoped: ScopedSnapshot = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("Invalid scoped checkpoint wrapper: {e}"))?;
-            if scoped.format != SCOPED_FORMAT_VERSION
+            if scoped.format != plan.scoped_format()
                 || scoped.recheck.identity != *plan.identity()
                 || plan.identity().block_size != block_size.to_string()
                 || scoped.recheck.completed > plan.identity().total_blocks
@@ -288,11 +287,11 @@ impl CheckpointStore {
             return Err("Checkpoint puzzle number mismatch".into());
         }
         snapshot.validate_for_block_size(block_size)?;
-        if recheck
-            .as_ref()
-            .is_some_and(|r| !r.plan.is_covered_by(&snapshot.to_interval_set()))
-        {
-            return Err("Scoped checkpoint lost global coverage of its recheck source".into());
+        if recheck.as_ref().is_some_and(|r| {
+            !r.plan
+                .required_coverage_is_present(&snapshot.to_interval_set(), r.completed)
+        }) {
+            return Err("Scoped checkpoint lost required global coverage of its source or completed targets".into());
         }
         if Duration::try_from_secs_f64(snapshot.total_runtime_secs).is_err() {
             return Err("Checkpoint runtime exceeds the supported duration".into());
@@ -344,6 +343,12 @@ impl CheckpointStore {
             _lock: lock,
         };
         store.replay_and_repair_tail()?;
+        if store.recheck.as_ref().is_some_and(|r| {
+            !r.plan
+                .required_coverage_is_present(&store.filter.intervals, r.completed)
+        }) {
+            return Err("Replayed checkpoint lost global coverage of completed targets".into());
+        }
         Ok(store)
     }
 
@@ -608,12 +613,13 @@ impl CheckpointStore {
 
     pub fn compact(&mut self) -> Result<(), String> {
         let progress = self.recheck_progress();
+        let format = self.recheck.as_ref().map(|r| r.plan.scoped_format());
         self.compact_with_snapshot(move |state, path| {
             if let Some(recheck) = progress {
                 state.last_saved_timestamp = timestamp().max(state.last_saved_timestamp);
                 save_atomic_json(
                     &ScopedSnapshot {
-                        format: SCOPED_FORMAT_VERSION,
+                        format: format.expect("scoped progress has a format"),
                         recheck,
                         checkpoint: state.clone(),
                     },
@@ -1040,6 +1046,233 @@ mod tests {
         store.recheck_progress().unwrap().completed
     }
 
+    fn unverified_target_fixture(indices: &[u64]) -> (Fixture, RecheckPlan, PathBuf) {
+        let (fixture, _, history) = recheck_fixture();
+        let source = fixture.dir.join("targets.json");
+        let manifest = serde_json::json!({
+            "type": "puzzle71-unverified-targets", "format": 1,
+            "puzzle_number": PUZZLE_NUMBER,
+            "range_min": RANGE_MIN.to_string(), "range_max": RANGE_MAX.to_string(),
+            "block_size": BLOCK_SIZE.to_string(),
+            "target_hash160": crate::puzzle_config::TARGET_HASH160.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "block_indices": indices,
+        });
+        fs::write(&source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let plan = RecheckPlan::load(source, BLOCK_SIZE).unwrap();
+        (fixture, plan, history)
+    }
+
+    #[test]
+    fn unverified_targets_prepare_adds_no_coverage_and_completion_preserves_order_and_counts_only_missing_blocks()
+     {
+        let (fixture, plan, history) = unverified_target_fixture(&[7, 2, 88, 1]);
+        let original_source = fs::read(fixture.dir.join("targets.json")).unwrap();
+        let original_history = fs::read(&history).unwrap();
+        let original_journal = fs::read(history.with_extension("journal")).unwrap();
+        let mut store = initialize_scope(&fixture, plan.clone(), &history);
+        assert_eq!(progress(&store), 0);
+        assert_eq!(store.total_blocks_tested(), 4);
+        assert_eq!(store.total_keys_tested(), 4 * BLOCK_SIZE);
+        assert!(!store.is_scanned(88));
+        assert!(!store.is_scanned(1));
+        let prepared: ScopedSnapshot =
+            serde_json::from_slice(&fs::read(&fixture.path).unwrap()).unwrap();
+        assert_eq!(prepared.format, 3);
+        assert_eq!(prepared.checkpoint.total_blocks_tested, 4);
+        assert_eq!(
+            prepared.checkpoint.scanned_intervals,
+            vec![(2, 3), (7, 7), (99, 99)]
+        );
+        for (ordinal, (id, expected_count)) in
+            [(7, 4), (2, 4), (88, 5), (1, 6)].into_iter().enumerate()
+        {
+            assert_eq!(store.next_recheck_block(), Some(id));
+            // Persisting a pause or partial dispatch never certifies a target block.
+            store.persist_runtime(5.0 + ordinal as f64 * 2.0).unwrap();
+            assert_eq!(progress(&store), ordinal as u64);
+            assert_eq!(store.total_blocks_tested(), if ordinal < 3 { 4 } else { 5 });
+            assert!(
+                store
+                    .complete_block(123, 6.0 + ordinal as f64 * 2.0)
+                    .is_err()
+            );
+            store
+                .complete_block(id, 6.0 + ordinal as f64 * 2.0)
+                .unwrap();
+            assert_eq!(progress(&store), ordinal as u64 + 1);
+            assert_eq!(store.total_blocks_tested(), expected_count);
+            assert_eq!(
+                store.total_keys_tested(),
+                expected_count as u128 * BLOCK_SIZE
+            );
+        }
+        assert_eq!(store.next_recheck_block(), None);
+        store.complete_block(123, 13.0).unwrap();
+        assert_eq!(store.total_blocks_tested(), 7);
+        drop(store);
+        let reopened = reopen_scope(&fixture, plan).unwrap();
+        assert_eq!(progress(&reopened), 4);
+        assert_eq!(reopened.total_blocks_tested(), 7);
+        assert!(reopened.is_scanned(1) && reopened.is_scanned(88) && reopened.is_scanned(123));
+        assert_eq!(
+            fs::read(fixture.dir.join("targets.json")).unwrap(),
+            original_source
+        );
+        assert_eq!(fs::read(&history).unwrap(), original_history);
+        assert_eq!(
+            fs::read(history.with_extension("journal")).unwrap(),
+            original_journal
+        );
+    }
+
+    #[test]
+    fn unverified_target_sync_failure_keeps_missing_global_block_and_cursor_unpublished() {
+        let (fixture, plan, history) = unverified_target_fixture(&[88, 7]);
+        let mut store = initialize_scope(&fixture, plan, &history);
+        let error = store
+            .complete_block_with_sync(88, 5.0, |_| {
+                Err(std::io::Error::other("target fsync fault"))
+            })
+            .unwrap_err();
+        assert!(error.contains("target fsync fault"));
+        assert_eq!(progress(&store), 0);
+        assert_eq!(store.total_blocks_tested(), 4);
+        assert_eq!(store.total_runtime_secs(), 4.0);
+        assert_eq!(store.next_recheck_block(), Some(88));
+        assert!(!store.is_scanned(88));
+        assert!(store.persist_runtime(6.0).is_err());
+        assert!(store.complete_block(88, 6.0).is_err());
+        assert!(store.compact().is_err());
+    }
+
+    #[test]
+    fn unverified_target_partial_tail_and_compaction_replay_retain_exact_cursor_and_global_counts()
+    {
+        let (fixture, plan, history) = unverified_target_fixture(&[88, 7, 1]);
+        let old_journal;
+        {
+            let mut store = initialize_scope(&fixture, plan.clone(), &history);
+            store.complete_block(88, 5.0).unwrap();
+            store.complete_block(7, 6.0).unwrap();
+            old_journal = fixture.raw_journal();
+            store.compact().unwrap();
+        }
+        // Crash after the new snapshot became durable but before old journal truncation.
+        fs::write(fixture.path.with_extension("journal"), &old_journal).unwrap();
+        let partial = encode_line(&JournalRecord {
+            completed_block: Some(1),
+            recheck_ordinal: Some(2),
+            total_runtime_secs: 7.0,
+            saved_timestamp: 100,
+        })
+        .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(fixture.path.with_extension("journal"))
+            .unwrap()
+            .write_all(&partial[..partial.len() - 1])
+            .unwrap();
+        {
+            let mut store = reopen_scope(&fixture, plan.clone()).unwrap();
+            assert_eq!(progress(&store), 2);
+            assert_eq!(store.next_recheck_block(), Some(1));
+            assert_eq!(store.total_blocks_tested(), 5);
+            assert!(!store.is_scanned(1));
+            assert_eq!(fixture.raw_journal(), old_journal);
+            store.complete_block(1, 8.0).unwrap();
+            store.compact().unwrap();
+        }
+        let store = reopen_scope(&fixture, plan).unwrap();
+        assert_eq!(progress(&store), 3);
+        assert_eq!(store.next_recheck_block(), None);
+        assert_eq!(store.total_blocks_tested(), 6);
+        assert_eq!(store.total_keys_tested(), 6 * BLOCK_SIZE);
+        let snapshot: ScopedSnapshot =
+            serde_json::from_slice(&fs::read(&fixture.path).unwrap()).unwrap();
+        assert_eq!(snapshot.format, 3);
+        let header: JournalHeader =
+            decode_line(fixture.raw_journal().strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(header.format, 3);
+    }
+
+    #[test]
+    fn unverified_target_resume_rejects_missing_completed_prefix_before_replay_including_end_cursor()
+     {
+        for completed in [1, 3] {
+            let (fixture, plan, history) = unverified_target_fixture(&[88, 7, 1]);
+            let mut store = initialize_scope(&fixture, plan.clone(), &history);
+            for (ordinal, id) in [88, 7, 1].into_iter().take(completed).enumerate() {
+                store.complete_block(id, 5.0 + ordinal as f64).unwrap();
+            }
+            let old_journal = fixture.raw_journal();
+            store.compact().unwrap();
+            drop(store);
+            let mut snapshot: ScopedSnapshot =
+                serde_json::from_slice(&fs::read(&fixture.path).unwrap()).unwrap();
+            // Keep counters internally consistent while removing the first completed target.
+            snapshot
+                .checkpoint
+                .scanned_intervals
+                .retain(|&(start, end)| !(start <= 88 && 88 <= end));
+            snapshot.checkpoint.total_blocks_tested -= 1;
+            snapshot.checkpoint.total_keys_tested -= BLOCK_SIZE;
+            fs::write(&fixture.path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            // These valid old records could reconstruct block 88. A snapshot already
+            // claiming that cursor must be rejected before replay can conceal the loss.
+            fs::write(fixture.path.with_extension("journal"), old_journal).unwrap();
+            let error = reopen_scope(&fixture, plan).err().unwrap();
+            assert!(error.contains("required global coverage"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unverified_target_scope_rejects_legacy_format_wrong_journal_missing_pair_and_changed_source()
+    {
+        for damage in [
+            "snapshot-format",
+            "journal-format",
+            "missing-journal",
+            "changed-source",
+        ] {
+            let (fixture, mut plan, history) = unverified_target_fixture(&[88, 7]);
+            drop(initialize_scope(&fixture, plan.clone(), &history));
+            match damage {
+                "snapshot-format" => {
+                    let mut snapshot: ScopedSnapshot =
+                        serde_json::from_slice(&fs::read(&fixture.path).unwrap()).unwrap();
+                    snapshot.format = 2; // an old Format2 reader accepts only this value
+                    fs::write(&fixture.path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+                }
+                "journal-format" => {
+                    let mut header: JournalHeader =
+                        decode_line(fixture.raw_journal().strip_suffix(b"\n").unwrap()).unwrap();
+                    header.format = 2;
+                    fs::write(
+                        fixture.path.with_extension("journal"),
+                        encode_line(&header).unwrap(),
+                    )
+                    .unwrap();
+                }
+                "missing-journal" => {
+                    fs::remove_file(fixture.path.with_extension("journal")).unwrap()
+                }
+                "changed-source" => {
+                    let source = fixture.dir.join("targets.json");
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&source)
+                        .unwrap()
+                        .write_all(b"\n")
+                        .unwrap();
+                    plan = RecheckPlan::load(source, BLOCK_SIZE).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(reopen_scope(&fixture, plan).is_err(), "accepted {damage}");
+            assert!(CheckpointState::load_from_file(&fixture.path).is_err());
+        }
+    }
+
     #[test]
     fn scoped_recheck_revisits_global_blocks_in_order_then_counts_only_new_coverage() {
         let (fixture, plan, history) = recheck_fixture();
@@ -1256,7 +1489,7 @@ mod tests {
         let (fixture, plan, history) = recheck_fixture();
         drop(initialize_scope(&fixture, plan.clone(), &history));
         let mut header = JournalHeader::for_block_size(BLOCK_SIZE);
-        header.format = SCOPED_FORMAT_VERSION;
+        header.format = plan.scoped_format();
         header.recheck = Some(plan.identity().clone());
         header.recheck.as_mut().unwrap().kernel_sha256 = "wrong-kernel".into();
         fs::write(
