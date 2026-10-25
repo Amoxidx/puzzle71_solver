@@ -235,8 +235,8 @@ mod tests {
                 })
             })
             .unwrap();
-        assert_eq!(progress.total_keys, 262_144);
-        assert_eq!(progress.next_key, RANGE_MIN + 262_144);
+        assert_eq!(progress.total_keys, profile.batch_keys());
+        assert_eq!(progress.next_key, RANGE_MIN + profile.batch_keys());
     }
 
     #[test]

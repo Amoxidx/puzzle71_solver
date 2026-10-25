@@ -2,6 +2,7 @@
 
 use crate::power::controller::PowerMode;
 use crate::puzzle_config::RANGE_SIZE;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliAction {
@@ -10,6 +11,7 @@ pub enum CliAction {
     Benchmark,
     SelfTest,
     TelegramTest,
+    PrepareRecheck,
 }
 
 #[derive(Debug)]
@@ -21,6 +23,8 @@ pub struct CliOptions {
     pub web_port: u16,
     pub enable_tui: bool,
     pub action: CliAction,
+    pub recheck_source: Option<PathBuf>,
+    pub prepare_recheck_from: Option<PathBuf>,
 }
 
 impl CliOptions {
@@ -33,6 +37,8 @@ impl CliOptions {
             web_port: 8080,
             enable_tui: true,
             action: CliAction::Search,
+            recheck_source: None,
+            prepare_recheck_from: None,
         };
         let mut args = args.into_iter().peekable();
         let mut help = false;
@@ -44,6 +50,13 @@ impl CliOptions {
                 "--test-mini" => actions.push(CliAction::SelfTest),
                 "--telegram-test" => actions.push(CliAction::TelegramTest),
                 "--no-tui" => options.enable_tui = false,
+                "--recheck-source" => {
+                    options.recheck_source = Some(value(&argument, &mut args)?.into());
+                }
+                "--prepare-recheck-from" => {
+                    options.prepare_recheck_from = Some(value(&argument, &mut args)?.into());
+                    actions.push(CliAction::PrepareRecheck);
+                }
                 "--mode" => {
                     let value = value(&argument, &mut args)?;
                     options.mode = value.parse().map_err(|_| {
@@ -87,15 +100,26 @@ impl CliOptions {
         {
             return Err("Invalid --block-size; it must divide 2^70 exactly and produce at most 2^64-1 blocks".into());
         }
+        if options.prepare_recheck_from.is_some() && options.recheck_source.is_none() {
+            return Err("--prepare-recheck-from requires --recheck-source".into());
+        }
         if help {
             options.action = CliAction::Help;
         } else if let Some(&action) = actions.first() {
             if actions.iter().any(|&other| other != action) {
                 return Err(
-                    "Choose only one action: --bench, --test-mini or --telegram-test".into(),
+                    "Choose only one action: --bench, --test-mini, --telegram-test or --prepare-recheck-from".into(),
                 );
             }
             options.action = action;
+        }
+        if options.recheck_source.is_some()
+            && !matches!(
+                options.action,
+                CliAction::Search | CliAction::PrepareRecheck | CliAction::Help
+            )
+        {
+            return Err("--recheck-source applies only to search or --prepare-recheck-from".into());
         }
         Ok(options)
     }
@@ -164,5 +188,39 @@ mod tests {
     #[test]
     fn conflicting_actions_are_rejected_without_running_them() {
         assert!(parse(&["--bench", "--telegram-test"]).is_err());
+    }
+
+    #[test]
+    fn recheck_preparation_requires_source_and_excludes_other_actions() {
+        assert!(parse(&["--prepare-recheck-from", "copy.json"]).is_err());
+        assert!(parse(&["--recheck-source", "--help"]).is_err());
+        assert!(parse(&["--recheck-source", "old.json", "--bench"]).is_err());
+        assert!(
+            parse(&[
+                "--recheck-source",
+                "old.json",
+                "--prepare-recheck-from",
+                "copy.json",
+                "--test-mini"
+            ])
+            .is_err()
+        );
+        let options = parse(&[
+            "--recheck-source",
+            "old.json",
+            "--prepare-recheck-from",
+            "copy.json",
+        ])
+        .unwrap();
+        assert_eq!(options.action, CliAction::PrepareRecheck);
+        assert_eq!(options.recheck_source.unwrap(), PathBuf::from("old.json"));
+        assert_eq!(
+            options.prepare_recheck_from.unwrap(),
+            PathBuf::from("copy.json")
+        );
+        assert_eq!(
+            parse(&["--recheck-source", "old.json"]).unwrap().action,
+            CliAction::Search
+        );
     }
 }

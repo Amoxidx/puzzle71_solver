@@ -68,6 +68,35 @@ async function gotoDashboard(page: Page): Promise<void> {
 }
 
 test.describe("Puzzle #71 dashboard", () => {
+  test("legacy recheck progress distinguishes pending, completed and absent scopes", async ({ page }) => {
+    const live = {
+      is_running: false, mode: "BALANCED", progress_available: true,
+      total_keys_tested: "50331648", total_blocks_tested: 3, runtime_secs: 10,
+      current_keys_per_sec: 0, avg_keys_per_sec: 0, target_gpu_duty_pct: 70,
+      last_error: null, hit: null, claim: null, claim_busy: false,
+      recheck_progress: null as { completed: number; identity: { total_blocks: number } } | null,
+    };
+    await page.route("**/api/status", (route) => route.fulfill({ json: live }));
+    await gotoDashboard(page);
+    const progress = page.locator("#recheck-progress");
+    await expect(progress).toBeHidden();
+    live.recheck_progress = { completed: 1, identity: { total_blocks: 3 } };
+    await expect(progress).toBeVisible();
+    await expect(progress).toContainText("1 / 3 Blöcke");
+    await expect(progress).toContainText("Danach werden automatisch neue Bereiche gesucht");
+    await expect(page.locator("#val-total-blocks")).toHaveText("3");
+    live.progress_available = false;
+    await expect(progress).toBeHidden();
+    await expect(page.locator("#val-total-blocks")).toHaveText("Nicht verfügbar");
+    live.progress_available = true;
+    await expect(progress).toBeVisible();
+    live.recheck_progress.completed = 3;
+    await expect(progress).toContainText("Nachprüfung abgeschlossen: 3 Altblöcke");
+    await expect(progress).toContainText("Suche neuer Bereiche ist freigegeben");
+    live.recheck_progress = null;
+    await expect(progress).toBeHidden();
+  });
+
   test("unavailable restored progress is shown as unavailable rather than zero", async ({ page }) => {
     await page.route("**/api/status", (route) => route.fulfill({ json: {
       is_running: false, mode: "HIGH", progress_available: false,

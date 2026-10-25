@@ -8,6 +8,7 @@ use crate::claim::service::{ClaimOps, ClaimState, ClaimStatusDetails, ServiceErr
 use crate::claim::verify::ClaimSummary;
 use crate::crypto::cpu_engine::run_mini_puzzle_test;
 use crate::power::controller::{MAX_GPU_DUTY_CYCLE, PowerMode};
+use crate::search::recheck::RecheckProgress;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -64,6 +65,7 @@ pub struct SharedSolverState {
     pub last_throttle_sleep_ms: Arc<Mutex<f64>>,
     pub checkpoint_saved_timestamp: Arc<AtomicU64>,
     pub progress_available: Arc<AtomicBool>,
+    pub recheck_progress: Arc<Mutex<Option<RecheckProgress>>>,
     pub hit: Arc<Mutex<Option<PublicHitStatus>>>,
     pub last_error: Arc<Mutex<Option<String>>>,
     pub claim: Arc<Mutex<Option<Box<dyn ClaimOps + Send>>>>,
@@ -111,6 +113,7 @@ impl SharedSolverState {
             last_throttle_sleep_ms: Arc::new(Mutex::new(0.0)),
             checkpoint_saved_timestamp: Arc::new(AtomicU64::new(0)),
             progress_available: Arc::new(AtomicBool::new(false)),
+            recheck_progress: Arc::new(Mutex::new(None)),
             hit: Arc::new(Mutex::new(None)),
             last_error: Arc::new(Mutex::new(None)),
             claim: Arc::new(Mutex::new(None)),
@@ -143,6 +146,7 @@ struct StatusResponse {
     last_throttle_sleep_ms: f64,
     checkpoint_saved_timestamp: u64,
     progress_available: bool,
+    recheck_progress: Option<RecheckProgress>,
     hit: Option<PublicHitStatus>,
     last_error: Option<String>,
     claim: Option<ClaimState>,
@@ -375,6 +379,7 @@ fn handle_client(stream: &mut TcpStream, state: &SharedSolverState, port: u16) {
                 last_throttle_sleep_ms: *state.last_throttle_sleep_ms.lock().unwrap(),
                 checkpoint_saved_timestamp: state.checkpoint_saved_timestamp.load(Ordering::SeqCst),
                 progress_available: state.progress_available.load(Ordering::SeqCst),
+                recheck_progress: state.recheck_progress.lock().unwrap().clone(),
                 hit: state.hit.lock().unwrap().clone(),
                 last_error: state.last_error.lock().unwrap().clone(),
                 claim,

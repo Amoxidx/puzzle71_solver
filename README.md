@@ -59,6 +59,8 @@ Nach einem normalen Solver-Start führt das Programm zunächst den verpflichtend
 --telegram-test                      Telegram-Testnachricht senden und beenden
 --electricity-price <EUR/kWh>         Kostenparameter für die Anzeige, Standard: 0.34
 --block-size <keys>                   Teiler von 2^70 für die Suchblöcke
+--recheck-source <archive.json>        Gebundene Nachprüfung eines alten Checkpoints fortsetzen
+--prepare-recheck-from <copy.json>     Neuen Nachprüfungsstand aus einer angehaltenen Historienkopie vorbereiten
 --help, -h                            Hilfe anzeigen
 ```
 
@@ -92,11 +94,13 @@ Alle Profile sind global auf höchstens 90 % GPU-Duty begrenzt. Nach jedem Metal
 | --- | ---: | --- |
 | `eco` | 40 % | geringere Aktivzeit, kleinere Dispatches |
 | `balanced` | 70 % | ausgewogenes Standardprofil |
-| `high` | 85 % | höhere Aktivzeit und größere Dispatches |
-| `full` | 90 % (Obergrenze) | größter Dispatch, weiterhin mit Duty-Begrenzung |
+| `high` | 85 % | höhere angeforderte GPU-Aktivzeit |
+| `full` | 90 % (Obergrenze) | höchstes Duty-Limit, weiterhin mit Leerlaufzeit |
 | `auto` | startet bei 70 % | passt sich per Systemlast und geschätzter Package-Power geglättet an |
 
 Die Power- und Temperaturwerte im Dashboard sind Schätzwerte aus Prozess-/Systemlast und einem Modell; sie sind keine Messung eines externen Wattmeters oder Temperatursensors.
+
+`BALANCED` und `AUTO` verwenden bis zu 2.097.152 Schlüssel pro Dispatch (2.048 Threads × 1.024 Schritte). Im begrenzten Vergleich auf einem Apple M4 mit festem `BALANCED`-Duty von 70 % stieg die dauerhaft verbuchte Suchrate in jeweils zwei Minuten um 18,51 %. Gegenläufige längere Messpaare ergaben 15,57 % und 16,50 %. Gleiche physische Leistungsaufnahme wurde dabei nicht nachgewiesen. Eine Pause wirkt nach dem laufenden Dispatch; im Test dauerte dies höchstens 0,227 Sekunden. Die Auto-Glättung erfolgt pro Dispatch und benötigt mit größeren Dispatches mehr Zeit.
 
 Die Status-API meldet die tatsächlich gemessene Leerlaufzeit des letzten Dispatchs; der angezeigte Dispatch-Anteil verwendet diese Messung. Das Duty-Limit bestimmt die mindestens angeforderte Pause; der macOS-Scheduler kann sie verlängern. Die Startdienst-Einstellung `ProcessType` beeinflusst diese Zeitsteuerung und weitere CPU-/I/O-Beschränkungen. `Interactive` hebt gegenüber `Standard` solche Beschränkungen auf; das konfigurierte GPU-Duty-Limit bleibt bestehen. Eine höhere Suchrate ist kein Nachweis gleicher Leistungsaufnahme.
 
@@ -108,7 +112,39 @@ Ein vollständiger JSON-Snapshot wird stündlich oder bei einem Journal von mind
 
 Beim Start werden Puzzle, Suchbereich, Blockgröße, Zähler und Journal-Prüfsummen validiert. Bereits übernommene Journal-Blöcke werden nicht doppelt gezählt. Ein unvollständiger letzter Datensatz wird konservativ entfernt; vollständige beschädigte Datensätze führen zu einem Fehler. Ein laufender Block wird erst nach vollständigem Abschluss dauerhaft als abgedeckt markiert.
 
-Ein übernommener alter Checkpoint belegt weiterhin nur die damals gezählte Suchhistorie. Die korrigierte Metal-Feldarithmetik prüft diese früheren Kandidaten nicht rückwirkend erneut. Für eine vollständige erneute Prüfung ein frisches Arbeitsverzeichnis verwenden und die bisherige Historie getrennt sichern.
+Ein übernommener alter Checkpoint belegt weiterhin nur die damals gezählte Suchhistorie. Die korrigierte Metal-Feldarithmetik prüft diese früheren Kandidaten nicht automatisch rückwirkend erneut. Für eine gezielte Nachprüfung wird ein neuer, an das genaue Archiv gebundener Arbeitsstand vorbereitet. Er prüft dessen Blöcke trotz bestehender globaler Einträge erneut und zählt sie dabei nicht nochmals als neue Abdeckung. Erst vollständig berechnete und synchronisierte Blöcke erhöhen den getrennten Nachprüfungszähler. Danach geht derselbe Arbeitsstand automatisch zur zufälligen Suche neuer Bereiche über.
+
+Vorbereitung: Den laufenden Solver kontrolliert beenden, Snapshot **und** Journal gemeinsam in ein eigenes privates Kopieverzeichnis sichern und das unveränderte alte Archiv getrennt erhalten. Im folgenden Beispiel sind alle Pfade absolute Pfade; das aktuelle Verzeichnis `recheck-run` muss frisch sein. Die Blockgröße muss zur kopierten Historie und zum Archiv passen.
+
+```sh
+mkdir -m 700 recheck-run
+cd recheck-run
+/pfad/zum/puzzle71_solver --recheck-source /pfad/zum/legacy_source.json --prepare-recheck-from /pfad/zur/historienkopie/puzzle71_checkpoint.json --block-size 16777216
+/pfad/zum/puzzle71_solver --recheck-source /pfad/zum/legacy_source.json --block-size 16777216 --mode balanced
+```
+
+Die Vorbereitung startet weder GPU-Suche noch Auszahlung. Sie verlangt vorhandene, gültige Snapshot-/Journalkopien und lehnt bereits vorhandene Zieldateien ab. Archive mit fehlenden Blöcken in der kopierten globalen Historie werden abgelehnt. Das Archiv wird nur gelesen; keine Produktionsdatei als Historienkopie angeben. Die Nachprüfung bindet genaue Archivbytes, Blockgröße, Puzzlebereich, Ziel-HASH160 und eingebetteten Kernel. Eine abweichende Quelle oder ein ungekennzeichneter Arbeitsstand startet keine frische Suche.
+
+Für ausdrücklich **unbestätigte** Zielblöcke akzeptiert dasselbe `--recheck-source` außerdem einen versionierten JSON-Suchauftrag. Er ist kein Checkpoint und behauptet keine vergangene Abdeckung. Das folgende Beispiel verwendet `2^24` Schlüssel pro Block:
+
+```json
+{
+  "type": "puzzle71-unverified-targets",
+  "format": 1,
+  "puzzle_number": 71,
+  "range_min": "1180591620717411303424",
+  "range_max": "2361183241434822606847",
+  "block_size": "16777216",
+  "target_hash160": "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8",
+  "block_indices": [7, 2, 88, 1]
+}
+```
+
+Alle Felder sind verpflichtend; zusätzliche Felder, unbekannte Typen oder Versionen, doppelte IDs und IDs außerhalb des Puzzlebereichs werden abgelehnt. Bereichsgrenzen und Blockgröße sind kanonische dezimale Strings, Block-IDs sind JSON-Integer vom Typ `u64`. Die Liste muss mindestens eine ID enthalten. Die Reihenfolge bleibt exakt erhalten, auch zwischen unsortierten Gruppen; sie wird nicht nach IDs sortiert. Öffentliche Herkunftsbelege und SHA256-Werte der Originalarchive können separat aufbewahrt werden. Sie ändern den Suchauftrag nicht in eine Bestätigung alter Sucharbeit.
+
+Vorbereiten und starten erfolgt mit denselben Befehlen wie beim Archiv, mit dem Suchauftrag als Quelle. Die Vorbereitung übernimmt ausschließlich die echte kopierte Historie und fügt durch die Zielliste **keinen** globalen Block hinzu. Ein bereits global vorhandener Zielblock wird trotzdem erneut geprüft; ein bisher fehlender Zielblock erhöht erst nach vollständig abgeschlossener Berechnung und synchronisiertem Journaleintrag die globale Abdeckung. Pausen und Teilblöcke erhöhen den Zielcursor nicht. Bei Wiederaufnahme muss jeder Block des bereits abgeschlossenen Zielpräfixes global enthalten sein, einschließlich bei vollständig abgearbeiteter Liste. Der Legacy-Archivpfad verlangt weiterhin sämtliche Archivblöcke in der kopierten und fortgesetzten globalen Historie.
+
+Für die Wiederaufnahme gehören die unveränderte Quelle, der neue Snapshot und sein Journal zusammen. Genaue Quelldateibytes, Kernel und Puzzleparameter bleiben gebunden. Die Oberfläche zeigt gezählte globale Historie und Nachprüfungsfortschritt getrennt. Legacy-Archivstände verwenden Wrapper-/Journalformat 2, Suchaufträge für unbestätigte Ziele verwenden Format 3. Ältere Programme können die jeweils neueren Stände nicht laden. Ein bestehender Format-2-Arbeitsstand wird nicht in einen neuen Suchauftrag umgewandelt; dafür ist eine neue Vorbereitung aus einer angehaltenen Legacy-Historienkopie erforderlich. Bei einem Rückbau müssen deshalb auch Startargumente und Arbeitsverzeichnis zum jeweiligen Programmstand passen. Einen bestehenden aktuellen Arbeitsstand weiter sichern; ihn nicht durch eine alte Kopie ersetzen.
 
 ## Trefferverhalten und Geheimnisse
 

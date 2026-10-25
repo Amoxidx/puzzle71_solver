@@ -10,8 +10,9 @@ use crate::search::duplicate_filter::IntervalSet;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_CHECKPOINT_FILE: &str = "puzzle71_checkpoint.json";
@@ -46,46 +47,8 @@ impl CheckpointState {
 
     pub fn save_to_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), String> {
         let path = path.as_ref();
-        let tmp_path = path.with_extension("tmp");
-
-        self.last_saved_timestamp = current_timestamp();
-
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Serialization error: {}", e))?;
-
-        // Open with 0600 permissions
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| format!("Failed to open temp checkpoint file: {}", e))?;
-
-        file.write_all(json.as_bytes())
-            .map_err(|e| format!("Failed to write checkpoint: {}", e))?;
-        file.sync_all()
-            .map_err(|e| format!("Failed to sync checkpoint to disk: {}", e))?;
-        drop(file);
-
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Failed to secure checkpoint permissions: {}", e))?;
-
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| format!("Failed to atomically rename checkpoint: {}", e))?;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Failed to secure final checkpoint permissions: {}", e))?;
-
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| format!("Failed to sync checkpoint directory: {}", e))?;
-
-        Ok(())
+        self.last_saved_timestamp = current_timestamp().max(self.last_saved_timestamp);
+        save_atomic_json(self, path)
     }
 
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
@@ -100,8 +63,12 @@ impl CheckpointState {
         file.read_to_string(&mut content)
             .map_err(|e| format!("Failed to read checkpoint file: {}", e))?;
 
-        let state: CheckpointState = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?;
+        Self::from_json(content.as_bytes())
+    }
+
+    pub(crate) fn from_json(content: &[u8]) -> Result<Self, String> {
+        let state: CheckpointState = serde_json::from_slice(content)
+            .map_err(|e| format!("Failed to parse checkpoint JSON: {e}"))?;
 
         if state.puzzle_number != PUZZLE_NUMBER {
             return Err(format!(
@@ -179,6 +146,102 @@ impl CheckpointState {
     }
 }
 
+/// Shared atomic writer for the legacy state and explicitly versioned scoped snapshots.
+pub(crate) fn save_atomic_json(value: &impl Serialize, path: &Path) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|e| format!("Checkpoint serialization error: {e}"))?;
+    let mut temporary = CheckpointTemporary::create(path)?;
+    temporary.ensure_owned()?;
+    temporary
+        .file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to secure checkpoint temporary file: {e}"))?;
+    temporary.ensure_owned()?;
+    temporary
+        .file
+        .write_all(&json)
+        .and_then(|()| temporary.file.sync_all())
+        .map_err(|e| format!("Failed to write and sync checkpoint: {e}"))?;
+    temporary.ensure_owned()?;
+    std::fs::rename(&temporary.path, path)
+        .map_err(|e| format!("Failed to atomically rename checkpoint: {e}"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("Failed to sync checkpoint directory: {e}"))
+}
+
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+struct CheckpointTemporary {
+    path: PathBuf,
+    file: File,
+}
+
+impl CheckpointTemporary {
+    fn create(destination: &Path) -> Result<Self, String> {
+        for _ in 0..128 {
+            let serial = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+            let path = destination.with_extension(format!("tmp.{}.{serial}", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to create owned checkpoint temporary file: {error}"
+                    ));
+                }
+            }
+        }
+        Err("Checkpoint temporary filename collision limit reached".into())
+    }
+
+    fn ensure_owned(&self) -> Result<(), String> {
+        require_single_link_regular_file(&self.file, "checkpoint temporary file")?;
+        let owned = self
+            .file
+            .metadata()
+            .map_err(|e| format!("Failed to inspect owned checkpoint temporary file: {e}"))?;
+        let current = std::fs::symlink_metadata(&self.path)
+            .map_err(|e| format!("Failed to inspect checkpoint temporary pathname: {e}"))?;
+        if !current.is_file() || (current.dev(), current.ino()) != (owned.dev(), owned.ino()) {
+            return Err("Checkpoint temporary pathname no longer names its owned file".into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CheckpointTemporary {
+    fn drop(&mut self) {
+        // Remove only the pathname still naming our exclusively created inode.
+        // Same-user processes may still race these checks; this is not a sandbox.
+        if self.ensure_owned().is_ok() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub(crate) fn require_single_link_regular_file(file: &File, label: &str) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Failed to inspect {label}: {e}"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(format!(
+            "Refusing {label}: expected an exclusive regular file with one link"
+        ));
+    }
+    Ok(())
+}
+
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -254,5 +317,95 @@ mod tests {
         );
 
         std::fs::remove_file(path).expect("remove checkpoint fixture");
+    }
+    #[test]
+    fn existing_foreign_temp_names_are_never_truncated_or_removed() {
+        const CHILD: &str = "PUZZLE71_CHECKPOINT_TEMP_COLLISION_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = std::path::PathBuf::from(dir);
+            let source = dir.join("immutable-archive");
+            let destination = dir.join("snapshot.json");
+            let legacy_temp = destination.with_extension("tmp");
+            let first_candidate =
+                destination.with_extension(format!("tmp.{}.0", std::process::id()));
+            std::fs::hard_link(&source, &legacy_temp).unwrap();
+            std::fs::hard_link(&source, &first_candidate).unwrap();
+            let before = std::fs::read(&source).unwrap();
+            let mut state = CheckpointState::new();
+            let result = state.save_to_file(&destination);
+            assert!(
+                std::fs::read(&source).unwrap() == before,
+                "existing temporary hardlink changed archive bytes"
+            );
+            assert_eq!(
+                std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            for foreign in [&legacy_temp, &first_candidate] {
+                assert_eq!(
+                    std::fs::metadata(foreign).unwrap().ino(),
+                    std::fs::metadata(&source).unwrap().ino()
+                );
+            }
+            assert!(
+                result.is_ok(),
+                "fresh exclusive temp should bypass stable filename collisions: {result:?}"
+            );
+            assert!(CheckpointState::load_from_file(&destination).is_ok());
+            return;
+        }
+        let directory = temp_checkpoint_path("foreign-temp").with_extension("dir");
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("immutable-archive");
+        std::fs::write(&source, b"public immutable checkpoint archive fixture").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "search::checkpoint::tests::existing_foreign_temp_names_are_never_truncated_or_removed", "--nocapture"])
+            .env(CHILD, &directory).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                std::fs::remove_dir_all(&directory).unwrap();
+                assert!(status.success(), "foreign temporary collision child failed");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                std::fs::remove_dir_all(&directory).unwrap();
+                panic!("foreign temporary collision child blocked checkpoint save");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[test]
+    fn replaced_temporary_path_is_rejected_and_foreign_name_survives_cleanup() {
+        let directory = temp_checkpoint_path("replaced-temp").with_extension("dir");
+        std::fs::create_dir(&directory).unwrap();
+        let destination = directory.join("snapshot.json");
+        let temporary = CheckpointTemporary::create(&destination).unwrap();
+        let own_path = directory.join("retained-owned-temp");
+        std::fs::rename(&temporary.path, &own_path).unwrap();
+        let archive = directory.join("immutable-archive");
+        std::fs::write(&archive, b"public immutable archive fixture").unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::hard_link(&archive, &temporary.path).unwrap();
+        let foreign_path = temporary.path.clone();
+        let result = temporary.ensure_owned();
+        drop(temporary);
+        assert!(
+            foreign_path.exists(),
+            "cleanup must leave the replacement foreign pathname intact"
+        );
+        assert!(result.is_err(), "FD/path inode mismatch must fail closed");
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            b"public immutable archive fixture"
+        );
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
